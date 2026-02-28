@@ -94,6 +94,18 @@ export interface WorkflowResult {
 }
 
 /**
+ * Validation result from validators (Phase 2)
+ */
+export interface ValidationResult {
+  phase: string;
+  success: boolean;
+  errors: string[];
+  warnings: string[];
+  duration: number; // in milliseconds
+  details: Record<string, unknown>;
+}
+
+/**
  * Execution context for all phases
  */
 export interface ExecutionContext {

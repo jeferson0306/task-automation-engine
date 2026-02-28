@@ -79,7 +79,7 @@ export class WorkflowOrchestrator {
       if (!branches.all.includes(branchName)) {
         // Try main first, then master
         const baseBranch = branches.all.includes('origin/main') ? 'origin/main' : 'origin/master';
-        await this.git.checkoutLocalBranch(branchName, baseBranch);
+        await this.git.checkoutLocalBranch(branchName, baseBranch as any);
         logger.info(`Branch created from: ${baseBranch}`);
       } else {
         await this.git.checkout(branchName);
