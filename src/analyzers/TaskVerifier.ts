@@ -6,6 +6,7 @@ import { ExecutionContext, Task, ProjectSnapshot } from '../core/types.js';
 import ProjectScanner from './ProjectScanner.js';
 import FilePolicy, { FileModificationPolicy } from '../core/FilePolicy.js';
 import PreciseFileFinder, { PreciseFileMatch, CodeReferences } from '../core/PreciseFileFinder.js';
+import CodeValidator, { CodeValidationResult } from '../core/CodeValidator.js';
 
 /**
  * Task implementation status
@@ -110,13 +111,15 @@ export class TaskVerifier {
     const taskReferences = await this.findTaskReferences(context, snapshot);
     
     // STEP 5: Validate actual code content (read the code and check if bug exists)
-    const codeValidation = await this.validateCodeContent(context, snapshot, codeReferences, taskDescription);
+    const { evidence: codeValidationEvidence, validationResult } = await this.validateCodeContent(
+      context, snapshot, codeReferences, taskDescription
+    );
 
     // Build evidence from precise matches
     const evidence: TaskEvidence[] = [
       ...taskReferences,
       ...this.convertPreciseMatchesToEvidence(preciseMatches),
-      ...codeValidation,
+      ...codeValidationEvidence,
     ];
 
     // Identify excluded files (files we WON'T suggest modifying)
@@ -124,8 +127,8 @@ export class TaskVerifier {
 
     const testCoverage = await this.analyzeTestCoverage(context, taskDescription, snapshot, codeReferences);
 
-    const status = this.determineStatusPrecise(evidence, gitChanges, testCoverage, preciseMatches, codeValidation);
-    const confidence = this.calculateConfidencePrecise(evidence, gitChanges, testCoverage, preciseMatches, codeValidation);
+    const status = this.determineStatusPrecise(evidence, gitChanges, testCoverage, preciseMatches, codeValidationEvidence, validationResult);
+    const confidence = this.calculateConfidencePrecise(evidence, gitChanges, testCoverage, preciseMatches, codeValidationEvidence, validationResult);
     const relatedFiles = this.identifyRelatedFilesPrecise(preciseMatches, gitChanges);
     const recommendations = this.generateRecommendations(status, evidence, gitChanges, testCoverage);
     const aiGuidance = this.generateAIGuidancePrecise(
@@ -173,14 +176,16 @@ export class TaskVerifier {
 
   /**
    * Validate actual code content - READ the code and check if bug/fix exists
+   * Uses CodeValidator to actually parse and analyze the code
    */
   private async validateCodeContent(
     context: ExecutionContext,
     snapshot: ProjectSnapshot,
     codeReferences: CodeReferences,
     taskDescription: string
-  ): Promise<TaskEvidence[]> {
+  ): Promise<{ evidence: TaskEvidence[]; validationResult?: CodeValidationResult }> {
     const evidence: TaskEvidence[] = [];
+    let mainValidationResult: CodeValidationResult | undefined;
 
     // For each class/method mentioned, actually READ and validate the code
     for (const pattern of codeReferences.patterns) {
@@ -194,31 +199,51 @@ export class TaskVerifier {
 
       if (!classFile || !classFile.content) continue;
 
-      // Validate if the code matches the bug description
-      const validation = await PreciseFileFinder.validateCodeMatchesBug(
-        classFile, methodName, taskDescription
-      );
+      // Use CodeValidator to actually read and validate the code
+      const validation = await CodeValidator.validate(classFile, methodName, taskDescription);
+      mainValidationResult = validation;
 
-      if (validation.matches) {
-        evidence.push({
-          type: 'code_validation',
-          file: classFile.path,
-          snippet: validation.currentCode?.substring(0, 200) || '',
-          confidence: 90,
-          description: `Code validation: ${validation.evidence}`,
-        });
-      } else {
-        evidence.push({
-          type: 'code_validation',
-          file: classFile.path,
-          snippet: validation.currentCode?.substring(0, 200) || '',
-          confidence: 30,
-          description: `Code may not match bug: ${validation.evidence}`,
-        });
+      // Build evidence based on validation result
+      let description: string;
+      let confidence: number;
+
+      switch (validation.status) {
+        case 'bug_exists':
+          description = `🔴 BUG EXISTS: ${validation.explanation}`;
+          confidence = validation.confidence;
+          break;
+        case 'fix_applied':
+          description = `🟢 FIX APPLIED: ${validation.explanation}`;
+          confidence = validation.confidence;
+          break;
+        case 'partial_fix':
+          description = `🟡 PARTIAL FIX: ${validation.explanation}`;
+          confidence = validation.confidence;
+          break;
+        default:
+          description = `⚪ UNKNOWN: ${validation.explanation}`;
+          confidence = validation.confidence;
+      }
+
+      evidence.push({
+        type: 'code_validation',
+        file: classFile.path,
+        line: validation.evidence.lineNumber,
+        snippet: validation.evidence.codeSnippet.substring(0, 300) || '',
+        confidence,
+        description,
+      });
+
+      // Log what was found
+      if (validation.evidence.bugIndicatorsFound.length > 0) {
+        logger.info(`  Found bug indicators: ${validation.evidence.bugIndicatorsFound.join(', ')}`);
+      }
+      if (validation.evidence.fixIndicatorsFound.length > 0) {
+        logger.info(`  Found fix indicators: ${validation.evidence.fixIndicatorsFound.join(', ')}`);
       }
     }
 
-    return evidence;
+    return { evidence, validationResult: mainValidationResult };
   }
 
   /**
@@ -264,14 +289,15 @@ export class TaskVerifier {
   }
 
   /**
-   * Determine status using precise matching
+   * Determine status using precise matching AND code validation
    */
   private determineStatusPrecise(
     evidence: TaskEvidence[],
     gitChanges: GitChange[],
     testCoverage: TaskVerificationResult['testCoverage'],
     preciseMatches: PreciseFileMatch[],
-    codeValidation: TaskEvidence[]
+    codeValidation: TaskEvidence[],
+    validationResult?: CodeValidationResult
   ): TaskImplementationStatus {
     // If no precise matches found, task is NOT IMPLEMENTED
     if (preciseMatches.length === 0) {
@@ -279,17 +305,57 @@ export class TaskVerifier {
       return 'NOT_IMPLEMENTED';
     }
 
-    // Check if code validation shows the bug still exists
-    const bugStillExists = codeValidation.some(e => 
-      e.confidence >= 70 && e.description.includes('Code validation:')
-    );
+    // Use CodeValidator result if available - this is the most accurate
+    if (validationResult) {
+      logger.info(`Code validation status: ${validationResult.status}`);
+      
+      switch (validationResult.status) {
+        case 'bug_exists':
+          // Bug pattern found in code → NOT IMPLEMENTED
+          logger.info('Bug pattern found in code - task NOT IMPLEMENTED');
+          return 'NOT_IMPLEMENTED';
+          
+        case 'fix_applied':
+          // Fix pattern found, no bug pattern → Check if committed
+          const relevantFiles = preciseMatches.map(m => m.file);
+          const hasUncommittedChanges = gitChanges.some(
+            g => relevantFiles.some(f => g.file.includes(path.basename(f)))
+          );
+          
+          if (hasUncommittedChanges) {
+            logger.info('Fix applied but not committed - IMPLEMENTED_NOT_COMMITTED');
+            return 'IMPLEMENTED_NOT_COMMITTED';
+          }
+          
+          // Check if there's a commit reference
+          const hasCommitReference = evidence.some(
+            e => e.type === 'task_reference' && e.file === 'git-history'
+          );
+          
+          if (hasCommitReference) {
+            logger.info('Fix applied and committed - IMPLEMENTED');
+            return testCoverage.hasTests ? 'IMPLEMENTED' : 'NEEDS_REVIEW';
+          }
+          
+          // Fix is in the code but we don't know if it was committed
+          logger.info('Fix found in code - NEEDS_REVIEW');
+          return 'NEEDS_REVIEW';
+          
+        case 'partial_fix':
+          logger.info('Partial fix detected - PARTIALLY_IMPLEMENTED');
+          return 'PARTIALLY_IMPLEMENTED';
+          
+        default:
+          // Unknown status - fall through to legacy logic
+          break;
+      }
+    }
 
-    // Check for direct task references in commits
+    // Legacy logic as fallback
     const hasCommitReference = evidence.some(
       e => e.type === 'task_reference' && e.file === 'git-history'
     );
 
-    // Check for uncommitted changes in the EXACT files mentioned
     const relevantFiles = preciseMatches.map(m => m.file);
     const hasRelevantUncommittedChanges = gitChanges.some(
       g => relevantFiles.some(f => g.file.includes(path.basename(f)))
@@ -300,7 +366,6 @@ export class TaskVerifier {
     }
 
     if (hasRelevantUncommittedChanges) {
-      // Check if changes are in the exact file mentioned
       const exactMatch = gitChanges.some(g => 
         preciseMatches.some(m => g.file === m.file || g.file.endsWith(path.basename(m.file)))
       );
@@ -310,44 +375,52 @@ export class TaskVerifier {
       }
     }
 
-    // If we found the file but no changes, check if bug still exists
-    if (bugStillExists) {
-      return 'NOT_IMPLEMENTED';
-    }
-
-    // Found file, no git changes, code doesn't match bug pattern
     return 'NEEDS_REVIEW';
   }
 
   /**
-   * Calculate confidence using precise matching
+   * Calculate confidence using precise matching AND code validation
    */
   private calculateConfidencePrecise(
     evidence: TaskEvidence[],
     gitChanges: GitChange[],
     testCoverage: TaskVerificationResult['testCoverage'],
     preciseMatches: PreciseFileMatch[],
-    codeValidation: TaskEvidence[]
+    codeValidation: TaskEvidence[],
+    validationResult?: CodeValidationResult
   ): number {
     if (preciseMatches.length === 0) return 10;
 
-    // Base confidence from precise matches
+    // If we have a validation result, use its confidence as primary
+    if (validationResult && validationResult.status !== 'unknown') {
+      let confidence = validationResult.confidence;
+      
+      // Boost for exact file matches
+      if (preciseMatches.some(m => m.matchType === 'exact_method')) {
+        confidence += 5;
+      }
+      
+      // Boost for tests
+      if (testCoverage.hasTests) {
+        confidence += 5;
+      }
+      
+      return Math.min(Math.round(confidence), 100);
+    }
+
+    // Fallback: Base confidence from precise matches
     const matchConfidence = Math.max(...preciseMatches.map(m => m.confidence), 0);
     
-    // Validation confidence
     const validationConfidence = codeValidation.length > 0 
       ? Math.max(...codeValidation.map(e => e.confidence), 0)
       : 50;
 
-    // Combine confidences
     let confidence = (matchConfidence * 0.6) + (validationConfidence * 0.4);
 
-    // Boost for exact method matches
     if (preciseMatches.some(m => m.matchType === 'exact_method')) {
       confidence += 10;
     }
 
-    // Boost for git changes in exact files
     const relevantChanges = gitChanges.filter(g => 
       preciseMatches.some(m => g.file.includes(path.basename(m.file)))
     );
@@ -355,7 +428,6 @@ export class TaskVerifier {
       confidence += 15;
     }
 
-    // Boost for tests
     if (testCoverage.hasTests) {
       confidence += 10;
     }
