@@ -13,9 +13,17 @@ import reportGenerator from '../core/ReportGenerator.js';
 import { Task, WorkflowResult, TaskStatus, ExecutionContext } from '../core/types.js';
 
 /**
+ * Analysis workflow options
+ */
+export interface AnalysisWorkflowOptions {
+  createBranch?: boolean;  // Default: false - do NOT create branch automatically
+  branchNamePattern?: string;  // Optional: custom branch name pattern
+}
+
+/**
  * Phase 1-2: Analysis Workflow (Enhanced with new analyzers)
  * - Parse task
- * - Setup git branch
+ * - Setup git branch (optional, disabled by default)
  * - Deep project scan (ProjectScanner)
  * - X-Ray analysis (XRayAnalyzer)
  * - Contract extraction (ContractExtractor)
@@ -23,7 +31,7 @@ import { Task, WorkflowResult, TaskStatus, ExecutionContext } from '../core/type
  * - Extract test patterns
  * - Generate reports
  */
-export async function runAnalysisWorkflow(task: Task): Promise<ExecutionContext> {
+export async function runAnalysisWorkflow(task: Task, options?: AnalysisWorkflowOptions): Promise<ExecutionContext> {
   logger.info('╔════════════════════════════════════════════════════════════╗');
   logger.info('║         PHASE 0-2: ANALYSIS WORKFLOW (ENHANCED)           ║');
   logger.info('╚════════════════════════════════════════════════════════════╝');
@@ -42,9 +50,13 @@ export async function runAnalysisWorkflow(task: Task): Promise<ExecutionContext>
     const context = await workflowOrchestrator.initialize(parsedTask);
     logger.info(`✓ Workflow initialized`);
 
-    // Create branch
-    await workflowOrchestrator.createBranch();
-    logger.info(`✓ Branch created: ${context.branchName}`);
+    // Create branch only if explicitly requested (default: false)
+    if (options?.createBranch === true) {
+      await workflowOrchestrator.createBranch();
+      logger.info(`✓ Branch created: ${context.branchName}`);
+    } else {
+      logger.info(`ℹ Branch creation skipped (use --create-branch to enable)`);
+    }
 
     // Generate setup report
     const setupReportPath = await reportGenerator.generateSetupReport(context);

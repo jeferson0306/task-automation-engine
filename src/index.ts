@@ -67,6 +67,10 @@ program
   .option('-p, --project <path>', 'Path to target project', process.cwd())
   .option('-f, --file <path>', 'Read task from file (JSON, CSV, or text)')
   .option('--quick', 'Quick analysis only (faster, less detailed)')
+  .option('--no-report', 'Do not generate report file')
+  .option('--multi-report', 'Generate multiple report files (default: single combined)')
+  .option('-o, --output <path>', 'Output directory for reports (default: project dir)')
+  .option('-v, --verbose', 'Show detailed output')
   .action(async (descriptionParts: string[], options: OptionValues) => {
     try {
       let taskInput: string;
@@ -109,8 +113,15 @@ program
         logger.info(`  Confidence: ${result.confidence}%`);
         logger.info(`  Summary: ${result.summary}`);
       } else {
-        // Full processing
-        const response = await AgentOrchestrator.process(taskInput, projectPath);
+        // Full processing with options
+        const agentOptions = {
+          generateReports: options.report !== false,
+          singleReportFile: !options.multiReport,
+          reportOutputDir: options.output ? path.resolve(options.output) : undefined,
+          verbose: options.verbose || false,
+        };
+        
+        const response = await AgentOrchestrator.process(taskInput, projectPath, agentOptions);
         
         // Display results
         logger.info('\n' + '─'.repeat(60));
@@ -201,6 +212,7 @@ program
   .option('--task-id <id>', 'Task ID')
   .option('--task-title <title>', 'Task title')
   .option('--task-desc <description>', 'Task description for context')
+  .option('--create-branch', 'Create git branch for task (disabled by default)')
   .action(async (options: OptionValues) => {
     try {
       const task: Task = {
@@ -212,7 +224,9 @@ program
         projectPath: options.projectPath || process.cwd(),
       };
 
-      await runAnalysisWorkflow(task);
+      await runAnalysisWorkflow(task, {
+        createBranch: options.createBranch || false,
+      });
     } catch (error) {
       logger.error('Error:', error);
       process.exit(1);
@@ -734,8 +748,44 @@ program
         logger.info(`\n📁 Git Changes (${verification.gitChanges.length} files):`);
         verification.gitChanges.forEach(g => {
           const icon = g.staged ? '✓' : '○';
-          logger.info(`   ${icon} ${g.status}: ${g.file}`);
+          const policyIcon = g.policy?.canModify ? '' : ' ⛔';
+          logger.info(`   ${icon} ${g.status}: ${g.file}${policyIcon}`);
         });
+      }
+
+      // Show precise matches
+      if (verification.preciseMatches && verification.preciseMatches.length > 0) {
+        logger.info(`\n🎯 Precise File Matches (${verification.preciseMatches.length}):`);
+        verification.preciseMatches.forEach(m => {
+          const canModify = m.policy.canModify ? '✓' : '✗';
+          logger.info(`   [${canModify}] ${m.file}`);
+          logger.info(`      Type: ${m.matchType}, Confidence: ${m.confidence}%`);
+        });
+      }
+
+      // Show excluded files
+      if (verification.excludedFiles && verification.excludedFiles.length > 0) {
+        logger.info(`\n🚫 Excluded Files (${verification.excludedFiles.length}):`);
+        verification.excludedFiles.slice(0, 5).forEach(e => {
+          logger.info(`   - ${path.basename(e.file)}: ${e.reason}`);
+        });
+        if (verification.excludedFiles.length > 5) {
+          logger.info(`   ... and ${verification.excludedFiles.length - 5} more`);
+        }
+      }
+
+      // Show code references
+      if (verification.codeReferences) {
+        const refs = verification.codeReferences;
+        if (refs.classes.length > 0 || refs.methods.length > 0) {
+          logger.info(`\n📌 Code References (from task):`);
+          if (refs.classes.length > 0) {
+            logger.info(`   Classes: ${refs.classes.join(', ')}`);
+          }
+          if (refs.methods.length > 0) {
+            logger.info(`   Methods: ${refs.methods.join(', ')}`);
+          }
+        }
       }
 
       logger.info(`\n🧪 Test Coverage:`);
@@ -800,20 +850,73 @@ function generateVerificationReport(verification: any): string {
   report += `- **Confidence:** ${verification.confidence}%\n`;
   report += `- **Summary:** ${verification.summary}\n\n`;
 
+  // Code references section
+  if (verification.codeReferences) {
+    const refs = verification.codeReferences;
+    if (refs.classes.length > 0 || refs.methods.length > 0) {
+      report += `## Code References (Extracted from Task)\n`;
+      if (refs.classes.length > 0) {
+        report += `- **Classes:** ${refs.classes.join(', ')}\n`;
+      }
+      if (refs.methods.length > 0) {
+        report += `- **Methods:** ${refs.methods.join(', ')}\n`;
+      }
+      if (refs.patterns.length > 0) {
+        report += `- **Patterns:** ${refs.patterns.join(', ')}\n`;
+      }
+      report += '\n';
+    }
+  }
+
+  // Precise matches section
+  if (verification.preciseMatches && verification.preciseMatches.length > 0) {
+    report += `## Precise File Matches\n`;
+    for (const m of verification.preciseMatches) {
+      const canModify = m.policy.canModify ? '✓' : '✗';
+      report += `- [${canModify}] \`${m.file}\`\n`;
+      report += `  - Match Type: ${m.matchType}\n`;
+      report += `  - Confidence: ${m.confidence}%\n`;
+      if (m.lineNumber) {
+        report += `  - Line: ${m.lineNumber}\n`;
+      }
+      if (!m.policy.canModify) {
+        report += `  - ⚠️ Cannot modify: ${m.policy.reason}\n`;
+      }
+    }
+    report += '\n';
+  }
+
   if (verification.evidence.length > 0) {
     report += `## Evidence\n`;
     for (const e of verification.evidence) {
       report += `### ${e.type} - ${e.file}${e.line ? `:${e.line}` : ''}\n`;
       report += `- Confidence: ${e.confidence}%\n`;
       report += `- Description: ${e.description}\n`;
-      report += `- Snippet: \`${e.snippet}\`\n\n`;
+      if (e.snippet) {
+        report += `- Snippet: \`${e.snippet.substring(0, 100)}${e.snippet.length > 100 ? '...' : ''}\`\n`;
+      }
+      report += '\n';
     }
   }
 
   if (verification.gitChanges.length > 0) {
     report += `## Git Changes\n`;
     for (const g of verification.gitChanges) {
-      report += `- ${g.status}: ${g.file} (${g.staged ? 'staged' : 'unstaged'})\n`;
+      const policyNote = g.policy?.canModify === false ? ` ⛔ ${g.policy.reason}` : '';
+      report += `- ${g.status}: ${g.file} (${g.staged ? 'staged' : 'unstaged'})${policyNote}\n`;
+    }
+    report += '\n';
+  }
+
+  // Excluded files section
+  if (verification.excludedFiles && verification.excludedFiles.length > 0) {
+    report += `## Excluded Files (Will NOT be Modified)\n`;
+    report += `_These files match the task but are excluded by policy:_\n\n`;
+    for (const e of verification.excludedFiles.slice(0, 10)) {
+      report += `- ~~\`${e.file}\`~~ - ${e.reason}\n`;
+    }
+    if (verification.excludedFiles.length > 10) {
+      report += `- ... and ${verification.excludedFiles.length - 10} more\n`;
     }
     report += '\n';
   }
@@ -834,7 +937,15 @@ function generateVerificationReport(verification: any): string {
   if (verification.aiGuidance.filesToModify.length > 0) {
     report += `### Files to Modify\n`;
     for (const f of verification.aiGuidance.filesToModify) {
-      report += `- ${f}\n`;
+      report += `- \`${f}\`\n`;
+    }
+    report += '\n';
+  }
+
+  if (verification.aiGuidance.filesExcluded && verification.aiGuidance.filesExcluded.length > 0) {
+    report += `### Files Excluded by Policy\n`;
+    for (const f of verification.aiGuidance.filesExcluded) {
+      report += `- ~~\`${f.file}\`~~ - ${f.reason}\n`;
     }
     report += '\n';
   }

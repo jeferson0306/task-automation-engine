@@ -5,12 +5,19 @@ import TaskInputParser, { ParsedTaskInput, TaskType } from './TaskInputParser.js
 import ProjectScanner from '../analyzers/ProjectScanner.js';
 import TaskVerifier, { TaskVerificationResult } from '../analyzers/TaskVerifier.js';
 import AIGuidanceGenerator, { AIInstructionSet } from '../analyzers/AIGuidanceGenerator.js';
-import ContractExtractor from '../analyzers/ContractExtractor.js';
-import AntiPatternDetector from '../analyzers/AntiPatternDetector.js';
-import XRayAnalyzer from '../analyzers/XRayAnalyzer.js';
-import AutoCodeReviewer from '../reviewers/AutoCodeReviewer.js';
-import SecurityReviewer from '../reviewers/SecurityReviewer.js';
-import { ExecutionContext, ParsedTask, TaskStatus, ProjectSnapshot, AntiPattern } from './types.js';
+import FilePolicy from './FilePolicy.js';
+import { ExecutionContext, ParsedTask, TaskStatus, ProjectSnapshot } from './types.js';
+
+/**
+ * Options for agent processing
+ */
+export interface AgentOptions {
+  generateReports?: boolean;
+  reportOutputDir?: string;
+  singleReportFile?: boolean;
+  skipBranchCreation?: boolean;
+  verbose?: boolean;
+}
 
 /**
  * Agent decision on what to do
@@ -64,20 +71,34 @@ export interface AgentResponse {
  * The main brain of the automation engine.
  * Takes any task input and automatically:
  * 1. Understands what needs to be done
- * 2. Analyzes the target project
- * 3. Determines current status
+ * 2. Analyzes the target project  
+ * 3. Determines current status (using PRECISE file matching)
  * 4. Decides on action
- * 5. Provides guidance or executes
+ * 5. Provides guidance (respecting file policies)
+ * 
+ * KEY PRINCIPLES:
+ * - PRECISE: Only modifies files explicitly mentioned in task
+ * - SAFE: Never suggests modifying migrations, locks, generated code
+ * - MINIMAL: Generates minimal output (1 file by default)
  */
 export class AgentOrchestrator {
   
+  private defaultOptions: AgentOptions = {
+    generateReports: true,
+    singleReportFile: true,  // Only generate ONE file by default
+    skipBranchCreation: true, // Don't create branches automatically
+    verbose: false,
+  };
+
   /**
    * Process any task input and decide what to do
    * This is the main entry point - just give it a task description
    */
-  async process(taskInput: string, projectPath: string): Promise<AgentResponse> {
+  async process(taskInput: string, projectPath: string, options?: AgentOptions): Promise<AgentResponse> {
+    const opts = { ...this.defaultOptions, ...options };
+    
     logger.info('═'.repeat(60));
-    logger.info('  AGENT ORCHESTRATOR - Processing Task');
+    logger.info('  AGENT ORCHESTRATOR - Precise Mode');
     logger.info('═'.repeat(60));
     
     const startTime = Date.now();
@@ -89,7 +110,7 @@ export class AgentOrchestrator {
       this.logTaskUnderstanding(taskUnderstanding);
       
       // Step 2: Analyze the project
-      logger.info('\n🔍 Step 2: Analyzing project...');
+      logger.info('\n🔍 Step 2: Analyzing project (light scan)...');
       const projectSnapshot = await ProjectScanner.scan(projectPath);
       const projectContext = this.summarizeProjectContext(projectSnapshot, taskUnderstanding);
       this.logProjectContext(projectContext);
@@ -97,10 +118,18 @@ export class AgentOrchestrator {
       // Step 3: Create execution context
       const context = this.createContext(projectPath, taskUnderstanding, projectSnapshot);
       
-      // Step 4: Verify if task is already implemented
-      logger.info('\n🔎 Step 3: Checking implementation status...');
+      // Step 4: Verify if task is already implemented (PRECISE mode)
+      logger.info('\n🔎 Step 3: Checking implementation status (precise)...');
       const verificationResult = await TaskVerifier.verify(context, taskUnderstanding.description);
       this.logVerificationResult(verificationResult);
+      
+      // Log excluded files
+      if (verificationResult.excludedFiles.length > 0) {
+        logger.info(`\n🚫 Excluded ${verificationResult.excludedFiles.length} files from modification suggestions:`);
+        for (const excluded of verificationResult.excludedFiles.slice(0, 5)) {
+          logger.info(`   - ${path.basename(excluded.file)}: ${excluded.reason}`);
+        }
+      }
       
       // Step 5: Make decision
       logger.info('\n🧠 Step 4: Making decision...');
@@ -114,8 +143,8 @@ export class AgentOrchestrator {
         instructions = await AIGuidanceGenerator.generate(context, verificationResult, taskUnderstanding.description);
       }
       
-      // Step 7: Generate reports
-      const reports = await this.generateReports(projectPath, decision, verificationResult, instructions);
+      // Step 7: Generate reports (single file by default)
+      const reports = await this.generateReports(projectPath, decision, verificationResult, instructions, opts);
       
       // Step 8: Determine next steps
       const nextSteps = this.determineNextSteps(decision, verificationResult);
@@ -128,6 +157,9 @@ export class AgentOrchestrator {
       logger.info(`Duration: ${duration}ms`);
       logger.info(`Decision: ${decision.action.toUpperCase()}`);
       logger.info(`Confidence: ${decision.confidence}%`);
+      if (verificationResult.preciseMatches.length > 0) {
+        logger.info(`Precise matches: ${verificationResult.preciseMatches.length} files`);
+      }
       
       return {
         success: true,
@@ -481,34 +513,177 @@ export class AgentOrchestrator {
   }
 
   /**
-   * Generate reports
+   * Generate reports - by default generates SINGLE combined file
    */
   private async generateReports(
     projectPath: string,
     decision: AgentDecision,
     verification: TaskVerificationResult,
-    instructions?: AIInstructionSet
+    instructions?: AIInstructionSet,
+    options?: AgentOptions
   ): Promise<AgentResponse['reports']> {
+    if (options?.generateReports === false) {
+      return { summary: '' };
+    }
+
+    const outputDir = options?.reportOutputDir || projectPath;
+    const taskId = decision.details.taskUnderstanding.id || 'task';
+    
+    // Single combined report (default)
+    if (options?.singleReportFile !== false) {
+      const combinedReport = this.generateCombinedReport(decision, verification, instructions);
+      const reportPath = path.join(outputDir, `task-analysis-${taskId}.md`);
+      await writeFile(reportPath, combinedReport);
+      
+      logger.info(`   📄 Report: ${reportPath}`);
+      
+      return {
+        summary: reportPath,
+      };
+    }
+    
+    // Multiple reports (legacy behavior if explicitly requested)
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     
-    // Summary report
     const summary = this.generateSummaryReport(decision, verification);
-    const summaryPath = path.join(projectPath, `agent-summary-${timestamp}.md`);
+    const summaryPath = path.join(outputDir, `agent-summary-${timestamp}.md`);
     await writeFile(summaryPath, summary);
     
-    // Guidance report if available
     let guidancePath: string | undefined;
     if (instructions) {
       const guidance = await AIGuidanceGenerator.generateMarkdown(instructions);
-      guidancePath = path.join(projectPath, `agent-guidance-${timestamp}.md`);
+      guidancePath = path.join(outputDir, `agent-guidance-${timestamp}.md`);
       await writeFile(guidancePath, guidance);
     }
     
     return {
       summary: summaryPath,
-      verification: verification ? summaryPath : undefined,
+      verification: summaryPath,
       guidance: guidancePath,
     };
+  }
+
+  /**
+   * Generate a single combined report with all information
+   */
+  private generateCombinedReport(
+    decision: AgentDecision,
+    verification: TaskVerificationResult,
+    instructions?: AIInstructionSet
+  ): string {
+    const task = decision.details.taskUnderstanding;
+    const context = decision.details.projectContext;
+    
+    let report = `# Task Analysis Report
+
+> Task: ${task.id || 'N/A'} | Generated: ${new Date().toISOString()}
+
+## Status: ${verification.status} (${verification.confidence}% confidence)
+
+**Action Required**: ${decision.action.toUpperCase()}
+
+${decision.reasoning}
+
+---
+
+## Task Understanding
+
+| Field | Value |
+|-------|-------|
+| Type | ${task.type} |
+| Priority | ${task.priority} |
+| Title | ${task.title.substring(0, 60)}${task.title.length > 60 ? '...' : ''} |
+
+### Description
+${task.description.substring(0, 500)}${task.description.length > 500 ? '...' : ''}
+
+### Acceptance Criteria
+${task.acceptanceCriteria.length > 0 ? task.acceptanceCriteria.map(c => `- [ ] ${c}`).join('\n') : '_None specified_'}
+
+---
+
+## Files Analysis
+
+### Files to Modify (${verification.relatedFiles.length})
+${verification.relatedFiles.length > 0 
+  ? verification.relatedFiles.slice(0, 10).map(f => `- \`${f}\``).join('\n')
+  : '_No files identified_'}
+
+### Excluded Files (${verification.excludedFiles.length})
+${verification.excludedFiles.length > 0
+  ? verification.excludedFiles.slice(0, 5).map(e => `- ~~\`${path.basename(e.file)}\`~~ - ${e.reason}`).join('\n')
+  : '_None excluded_'}
+
+### Code References Found
+${verification.codeReferences.classes.length > 0 || verification.codeReferences.methods.length > 0
+  ? `- Classes: ${verification.codeReferences.classes.join(', ') || 'none'}
+- Methods: ${verification.codeReferences.methods.join(', ') || 'none'}`
+  : '_No specific code references extracted_'}
+
+---
+
+## Evidence
+
+${verification.evidence.slice(0, 8).map(e => 
+  `- **[${e.type}]** \`${path.basename(e.file)}\`${e.line ? `:${e.line}` : ''} - ${e.description}`
+).join('\n') || '_No evidence found_'}
+
+---
+
+## Recommended Steps
+
+${decision.details.suggestedApproach.map((s, i) => `${i + 1}. ${s}`).join('\n')}
+
+${decision.details.risks.length > 0 ? `
+### Risks
+${decision.details.risks.map(r => `- ⚠️ ${r}`).join('\n')}` : ''}
+
+---
+
+## Test Coverage
+
+- **Has Tests**: ${verification.testCoverage.hasTests ? '✅ Yes' : '❌ No'}
+- **Status**: ${verification.testCoverage.coverageStatus}
+${verification.testCoverage.testFiles.length > 0 
+  ? `- **Test Files**: ${verification.testCoverage.testFiles.slice(0, 3).map(f => path.basename(f)).join(', ')}`
+  : ''}
+
+`;
+
+    // Add guidance section if available
+    if (instructions) {
+      const filesToModify = instructions.implementation.filesToModify;
+      const filesToCreate = instructions.implementation.filesToCreate;
+      const validationChecks = instructions.validation.manualChecks;
+      
+      report += `
+---
+
+## Implementation Guidance
+
+### Summary
+Status: ${instructions.summary.status} | Action: ${instructions.summary.action} | Complexity: ${instructions.summary.estimatedComplexity}
+
+### Files to Modify
+${filesToModify.slice(0, 5).map((f: { path: string; reason: string }) => `- \`${f.path}\` - ${f.reason}`).join('\n') || '_None_'}
+
+### Files to Create
+${filesToCreate.slice(0, 3).map((f: { suggestedPath: string; purpose: string }) => `- \`${f.suggestedPath}\` - ${f.purpose}`).join('\n') || '_None_'}
+
+### Step-by-Step Instructions
+${instructions.steps.slice(0, 10).map((s: { description: string }, i: number) => `${i + 1}. ${s.description}`).join('\n')}
+
+### Validation Checklist
+${validationChecks.slice(0, 5).map((v: string) => `- [ ] ${v}`).join('\n')}
+`;
+    }
+
+    report += `
+---
+_Generated by Task Automation Engine - Precise Mode_
+`;
+
+    return report;
   }
 
   /**
