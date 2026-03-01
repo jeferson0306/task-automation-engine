@@ -225,6 +225,33 @@ export class ProjectConventionsAnalyzer {
    */
   private static async findConfigFiles(projectPath: string): Promise<string[]> {
     const configPatterns = [
+      // Build system configs (highest priority for understanding project)
+      'pom.xml',                    // Maven
+      'build.gradle',               // Gradle (Groovy)
+      'build.gradle.kts',           // Gradle (Kotlin)
+      'settings.gradle',            // Gradle settings
+      'settings.gradle.kts',        // Gradle settings (Kotlin)
+      'gradle.properties',          // Gradle properties
+      'package.json',               // Node.js
+      'Cargo.toml',                 // Rust
+      'go.mod',                     // Go
+      'requirements.txt',           // Python
+      'pyproject.toml',             // Python (modern)
+      'setup.py',                   // Python
+      'composer.json',              // PHP
+      'Gemfile',                    // Ruby
+      
+      // Application configs (Spring Boot, Quarkus, etc.)
+      'application.properties',
+      'application.yml',
+      'application.yaml',
+      'application-dev.properties',
+      'application-dev.yml',
+      'application-prod.properties',
+      'application-prod.yml',
+      'bootstrap.properties',
+      'bootstrap.yml',
+      
       // Editor/formatting configs
       '.editorconfig',
       '.prettierrc',
@@ -234,7 +261,7 @@ export class ProjectConventionsAnalyzer {
       '.prettierrc.js',
       'prettier.config.js',
       
-      // Java/Kotlin configs
+      // Java/Kotlin code style configs
       'checkstyle.xml',
       'pmd.xml',
       'spotbugs.xml',
@@ -242,6 +269,7 @@ export class ProjectConventionsAnalyzer {
       'ktlint.xml',
       '.ktlint',
       'google-java-format.xml',
+      'spotless.gradle',
       
       // JavaScript/TypeScript configs
       '.eslintrc',
@@ -249,16 +277,42 @@ export class ProjectConventionsAnalyzer {
       '.eslintrc.js',
       '.eslintrc.yml',
       'eslint.config.js',
+      'eslint.config.mjs',
       'tslint.json',
       'biome.json',
+      'tsconfig.json',
+      'jsconfig.json',
+      
+      // Testing configs
+      'jest.config.js',
+      'jest.config.ts',
+      'vitest.config.js',
+      'vitest.config.ts',
+      'pytest.ini',
+      '.nycrc',
+      
+      // CI/CD configs
+      '.gitlab-ci.yml',
+      'Jenkinsfile',
+      'azure-pipelines.yml',
+      '.travis.yml',
+      'bitbucket-pipelines.yml',
+      
+      // Docker configs
+      'Dockerfile',
+      'docker-compose.yml',
+      'docker-compose.yaml',
       
       // General
       '.stylelintrc',
       'sonar-project.properties',
+      '.env.example',
+      'Makefile',
     ];
 
     const found: string[] = [];
     
+    // Check root directory
     for (const pattern of configPatterns) {
       const filePath = path.join(projectPath, pattern);
       if (await fs.pathExists(filePath)) {
@@ -266,16 +320,39 @@ export class ProjectConventionsAnalyzer {
       }
     }
 
-    // Also check common subdirectories
-    const subDirs = ['config', '.config', 'build', '.github'];
-    for (const subDir of subDirs) {
+    // Check src/main/resources for Java projects (Spring Boot, etc.)
+    const resourceDirs = [
+      'src/main/resources',
+      'src/test/resources',
+      'config',
+      '.config',
+      'build',
+      '.github',
+      '.github/workflows',
+    ];
+
+    for (const subDir of resourceDirs) {
       const dirPath = path.join(projectPath, subDir);
       if (await fs.pathExists(dirPath)) {
         try {
           const files = await fs.readdir(dirPath);
           for (const file of files) {
-            if (file.includes('lint') || file.includes('style') || file.includes('format')) {
-              found.push(path.join(dirPath, file));
+            const fullPath = path.join(dirPath, file);
+            // Include application configs, yml files, properties files, workflow files
+            if (
+              file.startsWith('application') ||
+              file.endsWith('.properties') ||
+              file.endsWith('.yml') ||
+              file.endsWith('.yaml') ||
+              file.endsWith('.xml') ||
+              file.includes('lint') ||
+              file.includes('style') ||
+              file.includes('format')
+            ) {
+              const stat = await fs.stat(fullPath);
+              if (stat.isFile()) {
+                found.push(fullPath);
+              }
             }
           }
         } catch {
@@ -284,6 +361,7 @@ export class ProjectConventionsAnalyzer {
       }
     }
 
+    logger.debug(`  Config files found: ${found.map(f => path.basename(f)).join(', ')}`);
     return found;
   }
 

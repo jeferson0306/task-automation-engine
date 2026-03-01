@@ -227,8 +227,7 @@ ${context.task.acceptanceCriteria.map(c => `- [x] ${c}`).join('\n')}
 
 Closes #${context.task.taskId.split('-')[1] || 'TBD'}
 
-Co-authored-by: Task Automation Engine <automation@company.com>
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`;
+Co-authored-by: Task Automation Engine <noreply@example.com>`;
 
   return message;
 }

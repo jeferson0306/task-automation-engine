@@ -43,11 +43,74 @@ export interface CodeValidationResult {
  * 1. If the bug described in the task exists
  * 2. If the fix has been applied
  * 3. If it's a partial fix
+ * 
+ * IMPORTANT: This must be 100% GENERIC - no hardcoded patterns for specific
+ * projects, companies, or domains. It learns from the task description only.
  */
 export class CodeValidator {
 
   /**
+   * Clean a captured value from regex - removes punctuation, parentheses, etc.
+   */
+  private static cleanValue(value: string): string {
+    return value
+      .replace(/[().,;:!?\[\]{}'"]/g, '')  // Remove punctuation
+      .replace(/^\s+|\s+$/g, '')            // Trim whitespace
+      .toLowerCase();                        // Normalize case for comparison
+  }
+
+  /**
+   * Generate all possible variations of a pattern for searching in code
+   * This handles different naming conventions across languages
+   */
+  private static generatePatternVariations(pattern: string): string[] {
+    const clean = this.cleanValue(pattern);
+    const variations: string[] = [clean];
+    
+    // Original case preserved
+    const original = pattern.replace(/[().,;:!?\[\]{}'"]/g, '').trim();
+    if (original.toLowerCase() !== clean) {
+      variations.push(original.toLowerCase());
+    }
+
+    // If it's a property name like "createdAt", also search for:
+    // - getCreatedAt (Java/Kotlin getter)
+    // - get_created_at (Python-style)
+    // - created_at (snake_case)
+    if (/^[a-z]/.test(clean)) {
+      // Java/Kotlin getter: createdAt -> getCreatedAt
+      const getter = 'get' + clean.charAt(0).toUpperCase() + clean.slice(1);
+      variations.push(getter.toLowerCase());
+      
+      // Snake case: createdAt -> created_at
+      const snakeCase = clean.replace(/([A-Z])/g, '_$1').toLowerCase();
+      if (snakeCase !== clean) {
+        variations.push(snakeCase);
+      }
+    }
+
+    // If it contains dots (like entity.property), extract the property part
+    if (clean.includes('.')) {
+      const parts = clean.split('.');
+      const lastPart = parts[parts.length - 1];
+      if (lastPart && !variations.includes(lastPart)) {
+        variations.push(lastPart);
+        // Also add getter variation for the property
+        const getter = 'get' + lastPart.charAt(0).toUpperCase() + lastPart.slice(1);
+        variations.push(getter.toLowerCase());
+      }
+    }
+
+    return [...new Set(variations)]; // Deduplicate
+  }
+
+  /**
    * Extract bug and fix indicators from task description
+   * 
+   * This method understands natural language patterns in task descriptions:
+   * - DECLARATIVE: "uses X instead of Y" = X is WRONG, Y is correct
+   * - IMPERATIVE: "use X instead of Y" = X is CORRECT, Y is wrong
+   * - DIRECTIVE: "should use X", "must use X" = X is CORRECT
    */
   static extractIndicators(taskDescription: string): {
     bugIndicators: BugIndicator[];
@@ -55,83 +118,111 @@ export class CodeValidator {
   } {
     const bugIndicators: BugIndicator[] = [];
     const fixIndicators: FixIndicator[] = [];
-
-    // Pattern: "uses X instead of Y" or "using X instead of Y"
-    const usesInsteadPattern = /uses?\s+(?:the\s+)?([a-zA-Z.()_]+)\s+instead\s+of\s+(?:the\s+)?([a-zA-Z.()_]+)/gi;
+    const seenBugPatterns = new Set<string>();
+    const seenFixPatterns = new Set<string>();
+    
     let match;
-    while ((match = usesInsteadPattern.exec(taskDescription)) !== null) {
-      const wrongValue = match[1].replace(/[()]/g, '');
-      const correctValue = match[2].replace(/[()]/g, '');
-      
-      bugIndicators.push({
-        type: 'uses_wrong',
-        pattern: wrongValue,
-        description: `Code incorrectly uses ${wrongValue}`,
-      });
-      
-      fixIndicators.push({
-        type: 'should_use',
-        pattern: correctValue,
-        description: `Code should use ${correctValue}`,
-      });
-    }
 
-    // Pattern: "use X instead of Y"
-    const useInsteadPattern = /use\s+([a-zA-Z.()_]+)\s+instead\s+of\s+([a-zA-Z.()_]+)/gi;
-    while ((match = useInsteadPattern.exec(taskDescription)) !== null) {
-      const correctValue = match[1].replace(/[()]/g, '');
-      const wrongValue = match[2].replace(/[()]/g, '');
-      
-      bugIndicators.push({
-        type: 'uses_wrong',
-        pattern: wrongValue,
-        description: `Code incorrectly uses ${wrongValue}`,
-      });
-      
-      fixIndicators.push({
-        type: 'should_use',
-        pattern: correctValue,
-        description: `Code should use ${correctValue}`,
-      });
-    }
-
-    // Pattern: "should use X" or "must use X"
-    const shouldUsePattern = /(?:should|must|need\s+to)\s+use\s+([a-zA-Z.()_]+)/gi;
-    while ((match = shouldUsePattern.exec(taskDescription)) !== null) {
-      const value = match[1].replace(/[()]/g, '');
-      if (!fixIndicators.some(f => f.pattern === value)) {
-        fixIndicators.push({
-          type: 'should_use',
-          pattern: value,
-          description: `Code should use ${value}`,
+    // Helper to add bug indicator with deduplication
+    const addBugIndicator = (pattern: string, description: string) => {
+      const clean = this.cleanValue(pattern);
+      if (clean.length > 2 && !seenBugPatterns.has(clean)) {
+        seenBugPatterns.add(clean);
+        bugIndicators.push({
+          type: 'uses_wrong',
+          pattern: clean,
+          description,
         });
       }
+    };
+
+    // Helper to add fix indicator with deduplication
+    const addFixIndicator = (pattern: string, description: string) => {
+      const clean = this.cleanValue(pattern);
+      if (clean.length > 2 && !seenFixPatterns.has(clean)) {
+        seenFixPatterns.add(clean);
+        fixIndicators.push({
+          type: 'should_use',
+          pattern: clean,
+          description,
+        });
+      }
+    };
+
+    // =======================================================================
+    // PATTERN 1: DECLARATIVE - "uses X instead of Y" / "using X instead of Y"
+    // Meaning: Code currently uses X (WRONG) but should use Y (CORRECT)
+    // =======================================================================
+    const declarativePattern = /\b(?:uses|using|utilizes|utilizing)\s+(?:the\s+)?([a-zA-Z0-9_.()]+)\s+instead\s+of\s+(?:the\s+)?([a-zA-Z0-9_.()]+)/gi;
+    while ((match = declarativePattern.exec(taskDescription)) !== null) {
+      const wrongValue = match[1];
+      const correctValue = match[2];
+      addBugIndicator(wrongValue, `Code incorrectly uses ${wrongValue}`);
+      addFixIndicator(correctValue, `Code should use ${correctValue}`);
     }
 
-    // Pattern: "when X, use Y" (conditional fix)
-    const whenUsePattern = /when\s+(?:the\s+)?(\w+)\s+is\s+(\w+)[,\s]+use\s+([a-zA-Z.()_]+)/gi;
-    while ((match = whenUsePattern.exec(taskDescription)) !== null) {
-      const condition = `${match[1]} is ${match[2]}`;
-      const value = match[3].replace(/[()]/g, '');
-      
-      fixIndicators.push({
-        type: 'should_use',
-        pattern: value,
-        description: `When ${condition}, use ${value}`,
-      });
+    // =======================================================================
+    // PATTERN 2: IMPERATIVE - "use X instead of Y"
+    // Meaning: You should use X (CORRECT) instead of Y (WRONG)
+    // Note: Must NOT match "uses" - that's handled above
+    // =======================================================================
+    const imperativePattern = /\buse\s+(?:the\s+)?([a-zA-Z0-9_.()]+)\s+instead\s+of\s+(?:the\s+)?([a-zA-Z0-9_.()]+)/gi;
+    while ((match = imperativePattern.exec(taskDescription)) !== null) {
+      // Skip if this is actually "uses" (already handled by declarative)
+      const fullMatch = match[0];
+      if (/^uses?\s/i.test(fullMatch) && fullMatch.toLowerCase().startsWith('uses')) {
+        continue;
+      }
+      const correctValue = match[1];
+      const wrongValue = match[2];
+      addBugIndicator(wrongValue, `Code incorrectly uses ${wrongValue}`);
+      addFixIndicator(correctValue, `Code should use ${correctValue}`);
     }
 
-    // Pattern: property/field names like ".propertyName" or "entity.property"
-    const propertyPattern = /\.([a-zA-Z_][a-zA-Z0-9_]*(?:\(\))?)/g;
-    const properties = new Set<string>();
-    while ((match = propertyPattern.exec(taskDescription)) !== null) {
-      properties.add(match[1].replace(/[()]/g, ''));
+    // =======================================================================
+    // PATTERN 3: DIRECTIVE - "should use X", "must use X", "need to use X"
+    // =======================================================================
+    const directivePattern = /\b(?:should|must|need\s+to|needs\s+to)\s+use\s+(?:the\s+)?([a-zA-Z0-9_.()]+)/gi;
+    while ((match = directivePattern.exec(taskDescription)) !== null) {
+      addFixIndicator(match[1], `Code should use ${match[1]}`);
     }
 
-    // Pattern: method calls like "getX()" or "calculateX()"
-    const methodPattern = /\b(get[A-Z]\w*|calculate\w*|compute\w*|find\w*)\s*\(\)/g;
-    while ((match = methodPattern.exec(taskDescription)) !== null) {
-      properties.add(match[1]);
+    // =======================================================================
+    // PATTERN 4: CONDITIONAL - "when X is Y, use Z"
+    // =======================================================================
+    const conditionalPattern = /when\s+(?:the\s+)?(\w+)\s+is\s+(\w+)[,\s]+use\s+(?:the\s+)?([a-zA-Z0-9_.()]+)/gi;
+    while ((match = conditionalPattern.exec(taskDescription)) !== null) {
+      addFixIndicator(match[3], `When ${match[1]} is ${match[2]}, use ${match[3]}`);
+    }
+
+    // =======================================================================
+    // PATTERN 5: REPLACE/CHANGE - "replace X with Y", "change X to Y"
+    // =======================================================================
+    const replacePattern = /\b(?:replace|change|swap)\s+(?:the\s+)?([a-zA-Z0-9_.()]+)\s+(?:with|to|for)\s+(?:the\s+)?([a-zA-Z0-9_.()]+)/gi;
+    while ((match = replacePattern.exec(taskDescription)) !== null) {
+      addBugIndicator(match[1], `Replace ${match[1]}`);
+      addFixIndicator(match[2], `Use ${match[2]} instead`);
+    }
+
+    // =======================================================================
+    // PATTERN 6: WRONG/INCORRECT - "X is wrong/incorrect"
+    // =======================================================================
+    const wrongPattern = /\b([a-zA-Z0-9_.()]+)\s+is\s+(?:wrong|incorrect|buggy|broken)/gi;
+    while ((match = wrongPattern.exec(taskDescription)) !== null) {
+      addBugIndicator(match[1], `${match[1]} is incorrect`);
+    }
+
+    // =======================================================================
+    // PATTERN 7: FIX DESCRIPTION - "fix: ...", "bug: ..."
+    // Look for property names mentioned after these keywords
+    // =======================================================================
+    const fixDescPattern = /(?:fix|bug|issue|problem)[:\s]+.*?([a-zA-Z]+\.[a-zA-Z]+(?:\(\))?)/gi;
+    while ((match = fixDescPattern.exec(taskDescription)) !== null) {
+      // These are likely the problematic values
+      const parts = match[1].split('.');
+      if (parts.length >= 2) {
+        addBugIndicator(parts[parts.length - 1], `Related to fix: ${match[1]}`);
+      }
     }
 
     logger.info(`Extracted indicators:`);
@@ -144,6 +235,14 @@ export class CodeValidator {
   /**
    * Validate code against bug/fix indicators
    * Actually reads the code and checks for patterns
+   * 
+   * Uses pattern variations to handle different naming conventions:
+   * - camelCase: createdAt
+   * - PascalCase: CreatedAt  
+   * - snake_case: created_at
+   * - Java getter: getCreatedAt
+   * - Kotlin getter: getCreatedAt
+   * - Direct property: .createdAt
    */
   static async validateCode(
     file: ScannedFile,
@@ -183,41 +282,52 @@ export class CodeValidator {
     const code = methodCode.code.toLowerCase();
     const bugIndicatorsFound: string[] = [];
     const fixIndicatorsFound: string[] = [];
+    const debugInfo: string[] = [];
 
-    // Check for bug indicators
+    logger.info(`  Method code length: ${methodCode.code.length} chars, line ${methodCode.lineNumber}`);
+
+    // Check for bug indicators with all pattern variations
     for (const indicator of bugIndicators) {
-      const pattern = indicator.pattern.toLowerCase();
-      // Check for the pattern in various forms
-      const patterns = [
-        pattern,
-        pattern.replace(/([A-Z])/g, '_$1').toLowerCase(), // camelCase to snake_case
-        pattern.replace(/_/g, ''), // remove underscores
-      ];
+      const variations = this.generatePatternVariations(indicator.pattern);
+      logger.debug(`  Bug pattern "${indicator.pattern}" variations: ${variations.join(', ')}`);
       
-      for (const p of patterns) {
-        if (code.includes(p)) {
+      let found = false;
+      for (const variation of variations) {
+        if (code.includes(variation)) {
           bugIndicatorsFound.push(indicator.pattern);
+          debugInfo.push(`Found bug pattern "${indicator.pattern}" as "${variation}"`);
+          found = true;
           break;
         }
+      }
+      
+      if (!found) {
+        debugInfo.push(`Bug pattern "${indicator.pattern}" NOT found (tried: ${variations.join(', ')})`);
       }
     }
 
-    // Check for fix indicators
+    // Check for fix indicators with all pattern variations
     for (const indicator of fixIndicators) {
-      const pattern = indicator.pattern.toLowerCase();
-      const patterns = [
-        pattern,
-        pattern.replace(/([A-Z])/g, '_$1').toLowerCase(),
-        pattern.replace(/_/g, ''),
-      ];
+      const variations = this.generatePatternVariations(indicator.pattern);
+      logger.debug(`  Fix pattern "${indicator.pattern}" variations: ${variations.join(', ')}`);
       
-      for (const p of patterns) {
-        if (code.includes(p)) {
+      let found = false;
+      for (const variation of variations) {
+        if (code.includes(variation)) {
           fixIndicatorsFound.push(indicator.pattern);
+          debugInfo.push(`Found fix pattern "${indicator.pattern}" as "${variation}"`);
+          found = true;
           break;
         }
       }
+      
+      if (!found) {
+        debugInfo.push(`Fix pattern "${indicator.pattern}" NOT found (tried: ${variations.join(', ')})`);
+      }
     }
+
+    // Log debug info
+    debugInfo.forEach(info => logger.debug(`  ${info}`));
 
     // Determine status
     let status: CodeValidationResult['status'];
@@ -226,27 +336,36 @@ export class CodeValidator {
 
     const hasBugIndicators = bugIndicatorsFound.length > 0;
     const hasFixIndicators = fixIndicatorsFound.length > 0;
+    const totalBugIndicators = bugIndicators.length;
+    const totalFixIndicators = fixIndicators.length;
 
     if (hasBugIndicators && !hasFixIndicators) {
       // Bug pattern found, fix pattern not found → BUG EXISTS
       status = 'bug_exists';
-      confidence = 85 + (bugIndicatorsFound.length * 5);
-      explanation = `Bug pattern found: code uses ${bugIndicatorsFound.join(', ')} but should use ${fixIndicators.map(f => f.pattern).join(', ')}`;
+      // Higher confidence if we found more of the expected patterns
+      const foundRatio = bugIndicatorsFound.length / Math.max(totalBugIndicators, 1);
+      confidence = Math.round(80 + (foundRatio * 15));
+      explanation = `🔴 BUG EXISTS: code uses ${bugIndicatorsFound.join(', ')} but should use ${fixIndicators.map(f => f.pattern).join(', ')}`;
+      logger.info(`  🔴 BUG EXISTS: Found ${bugIndicatorsFound.join(', ')}`);
     } else if (!hasBugIndicators && hasFixIndicators) {
       // Bug pattern not found, fix pattern found → FIX APPLIED
       status = 'fix_applied';
-      confidence = 85 + (fixIndicatorsFound.length * 5);
-      explanation = `Fix appears applied: code uses ${fixIndicatorsFound.join(', ')} as expected`;
+      const foundRatio = fixIndicatorsFound.length / Math.max(totalFixIndicators, 1);
+      confidence = Math.round(80 + (foundRatio * 15));
+      explanation = `🟢 FIX APPLIED: code correctly uses ${fixIndicatorsFound.join(', ')}`;
+      logger.info(`  🟢 FIX APPLIED: Found ${fixIndicatorsFound.join(', ')}`);
     } else if (hasBugIndicators && hasFixIndicators) {
-      // Both found → PARTIAL FIX (might have multiple code paths)
+      // Both found → PARTIAL FIX (might have multiple code paths or conditional logic)
       status = 'partial_fix';
-      confidence = 60;
-      explanation = `Partial fix: found both bug pattern (${bugIndicatorsFound.join(', ')}) and fix pattern (${fixIndicatorsFound.join(', ')})`;
+      confidence = 65;
+      explanation = `🟡 PARTIAL FIX: found both bug pattern (${bugIndicatorsFound.join(', ')}) and fix pattern (${fixIndicatorsFound.join(', ')}) - code may have multiple branches`;
+      logger.info(`  🟡 PARTIAL FIX: Bug patterns=${bugIndicatorsFound.join(', ')}, Fix patterns=${fixIndicatorsFound.join(', ')}`);
     } else {
       // Neither found → UNKNOWN
       status = 'unknown';
-      confidence = 30;
-      explanation = `Could not determine status: neither bug nor fix patterns found in method`;
+      confidence = 25;
+      explanation = `⚪ UNKNOWN: Could not determine status - neither bug patterns (${bugIndicators.map(b => b.pattern).join(', ')}) nor fix patterns (${fixIndicators.map(f => f.pattern).join(', ')}) found in method`;
+      logger.info(`  ⚪ UNKNOWN: No patterns matched in method ${methodName}`);
     }
 
     return {

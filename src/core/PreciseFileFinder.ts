@@ -227,6 +227,7 @@ export class PreciseFileFinder {
 
   /**
    * Find a method within a class file
+   * Checks both full content and skeletal content, and reads file directly if needed
    */
   private static async findMethodInClass(
     snapshot: ProjectSnapshot,
@@ -240,28 +241,75 @@ export class PreciseFileFinder {
     
     for (const classMatch of classMatches) {
       const file = snapshot.files.find(f => f.path === classMatch.file);
-      if (!file || !file.content) continue;
+      if (!file) continue;
+
+      const policy = FilePolicy.evaluate(file.path);
+
+      // Option 1: Check skeletal content first (faster, no I/O)
+      if (file.skeletalContent) {
+        for (const classInfo of file.skeletalContent.classes || []) {
+          for (const method of classInfo.methods || []) {
+            if (method.name.toLowerCase() === methodName.toLowerCase()) {
+              matches.push({
+                file: file.path,
+                matchType: 'exact_method',
+                confidence: 95, // Slightly lower since we didn't see the actual code
+                evidence: `Found method ${className}.${methodName}() in skeletal content`,
+                snippet: `${method.visibility || ''} ${method.returnType || 'void'} ${method.name}(${
+                  method.parameters?.map(p => `${p.type} ${p.name}`).join(', ') || ''
+                })`,
+                policy,
+              });
+            }
+          }
+        }
+        // If found in skeletal, return
+        if (matches.length > 0) continue;
+      }
+
+      // Option 2: Check full content if available
+      let content = file.content;
+
+      // Option 3: Read file directly if no content (allows validation later)
+      if (!content) {
+        try {
+          content = await fs.readFile(file.path, 'utf-8');
+        } catch {
+          logger.warn(`Could not read file for method search: ${file.path}`);
+          // Still add the class match with lower confidence if we found the class
+          matches.push({
+            file: file.path,
+            matchType: 'likely_related',
+            confidence: 70,
+            evidence: `Class file found for ${className}, method ${methodName} not verified`,
+            policy,
+          });
+          continue;
+        }
+      }
 
       // Search for method definition
       const methodPatterns = [
         // Java/C#/TypeScript: public void methodName(
-        new RegExp(`(?:public|private|protected)?\\s*(?:static)?\\s*\\w+\\s+${methodName}\\s*\\(`, 'gm'),
+        new RegExp(`(?:public|private|protected)?\\s*(?:static)?\\s*[\\w<>\\[\\],\\s]*\\s+${methodName}\\s*\\(`, 'gmi'),
         // Python: def method_name(
-        new RegExp(`def\\s+${methodName}\\s*\\(`, 'gm'),
+        new RegExp(`def\\s+${methodName}\\s*\\(`, 'gmi'),
         // Go: func (r *Receiver) methodName(
-        new RegExp(`func\\s+(?:\\([^)]+\\)\\s+)?${methodName}\\s*\\(`, 'gm'),
-        // JavaScript/TypeScript: methodName( or methodName = (
-        new RegExp(`(?:async\\s+)?${methodName}\\s*[=(]`, 'gm'),
+        new RegExp(`func\\s+(?:\\([^)]+\\)\\s+)?${methodName}\\s*\\(`, 'gmi'),
+        // JavaScript/TypeScript: methodName( or methodName = ( or async methodName(
+        new RegExp(`(?:async\\s+)?${methodName}\\s*[=(]`, 'gmi'),
+        // Kotlin: fun methodName(
+        new RegExp(`fun\\s+${methodName}\\s*\\(`, 'gmi'),
       ];
 
-      const lines = file.content.split('\n');
+      const lines = content.split('\n');
+      let found = false;
       
-      for (let i = 0; i < lines.length; i++) {
+      for (let i = 0; i < lines.length && !found; i++) {
         const line = lines[i];
         for (const pattern of methodPatterns) {
+          pattern.lastIndex = 0; // Reset regex state
           if (pattern.test(line)) {
-            const policy = FilePolicy.evaluate(file.path);
-            
             matches.push({
               file: file.path,
               matchType: 'exact_method',
@@ -271,9 +319,21 @@ export class PreciseFileFinder {
               snippet: line.trim().substring(0, 100),
               policy,
             });
+            found = true;
             break;
           }
         }
+      }
+
+      // If method not found in content, still add the class as related
+      if (!found && classMatches.length > 0) {
+        matches.push({
+          file: file.path,
+          matchType: 'likely_related',
+          confidence: 60,
+          evidence: `Class ${className} found but method ${methodName} not located`,
+          policy,
+        });
       }
     }
 

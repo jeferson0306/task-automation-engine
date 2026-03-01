@@ -104,6 +104,18 @@ const P1_PATTERNS = [
   /routes?\.(ts|js)$/i,
   /api\.(ts|js)$/i,
   /middleware\.(ts|js)$/i,
+  // Utility classes are often mentioned in bug fixes
+  /Utils?\.(java|kt|ts|js|py)$/i,
+  /Helper\.(java|kt|ts|js|py)$/i,
+  /Util\.(java|kt|ts|js|py)$/i,
+  // Configuration and factory classes
+  /Config(uration)?\.(java|kt|ts|js)$/i,
+  /Factory\.(java|kt|ts|js)$/i,
+  // Mapper and converter classes
+  /Mapper\.(java|kt|ts|js)$/i,
+  /Converter\.(java|kt|ts|js)$/i,
+  // Validator classes
+  /Validator\.(java|kt|ts|js)$/i,
 ];
 
 /**
