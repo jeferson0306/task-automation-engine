@@ -197,10 +197,25 @@ export class TaskVerifier {
         path.basename(f.path).replace(/\.[^.]+$/, '') === className
       );
 
-      if (!classFile || !classFile.content) continue;
+      if (!classFile) continue;
+
+      // If content is empty (skeletal read), read the file directly
+      let fileContent = classFile.content;
+      if (!fileContent) {
+        try {
+          logger.info(`  Reading file directly: ${path.basename(classFile.path)}`);
+          fileContent = await fs.readFile(classFile.path, 'utf-8');
+        } catch (err) {
+          logger.warn(`  Could not read file: ${classFile.path}`);
+          continue;
+        }
+      }
+
+      // Create a temporary file object with content for validation
+      const fileWithContent = { ...classFile, content: fileContent };
 
       // Use CodeValidator to actually read and validate the code
-      const validation = await CodeValidator.validate(classFile, methodName, taskDescription);
+      const validation = await CodeValidator.validate(fileWithContent, methodName, taskDescription);
       mainValidationResult = validation;
 
       // Build evidence based on validation result
@@ -227,7 +242,7 @@ export class TaskVerifier {
 
       evidence.push({
         type: 'code_validation',
-        file: classFile.path,
+        file: fileWithContent.path,
         line: validation.evidence.lineNumber,
         snippet: validation.evidence.codeSnippet.substring(0, 300) || '',
         confidence,
