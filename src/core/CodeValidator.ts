@@ -74,18 +74,31 @@ export class CodeValidator {
     }
 
     // If it's a property name like "createdAt", also search for:
-    // - getCreatedAt (Java/Kotlin getter)
-    // - get_created_at (Python-style)
+    // - getCreatedAt / setCreatedAt (Java/Kotlin getter/setter)
+    // - isCreatedAt (boolean getter)
+    // - get_created_at / set_created_at (Python-style)
     // - created_at (snake_case)
     if (/^[a-z]/.test(clean)) {
-      // Java/Kotlin getter: createdAt -> getCreatedAt
-      const getter = 'get' + clean.charAt(0).toUpperCase() + clean.slice(1);
+      const capitalizedProp = clean.charAt(0).toUpperCase() + clean.slice(1);
+      
+      // Java/Kotlin/C# accessors
+      const getter = 'get' + capitalizedProp;
+      const setter = 'set' + capitalizedProp;
+      const boolGetter = 'is' + capitalizedProp;
+      const hasChecker = 'has' + capitalizedProp;
+      
       variations.push(getter.toLowerCase());
+      variations.push(setter.toLowerCase());
+      variations.push(boolGetter.toLowerCase());
+      variations.push(hasChecker.toLowerCase());
       
       // Snake case: createdAt -> created_at
       const snakeCase = clean.replace(/([A-Z])/g, '_$1').toLowerCase();
       if (snakeCase !== clean) {
         variations.push(snakeCase);
+        // Python-style accessors
+        variations.push('get_' + snakeCase);
+        variations.push('set_' + snakeCase);
       }
     }
 
@@ -95,9 +108,11 @@ export class CodeValidator {
       const lastPart = parts[parts.length - 1];
       if (lastPart && !variations.includes(lastPart)) {
         variations.push(lastPart);
-        // Also add getter variation for the property
-        const getter = 'get' + lastPart.charAt(0).toUpperCase() + lastPart.slice(1);
-        variations.push(getter.toLowerCase());
+        // Also add accessor variations for the property
+        const capitalizedProp = lastPart.charAt(0).toUpperCase() + lastPart.slice(1);
+        variations.push(('get' + capitalizedProp).toLowerCase());
+        variations.push(('set' + capitalizedProp).toLowerCase());
+        variations.push(('is' + capitalizedProp).toLowerCase());
       }
     }
 

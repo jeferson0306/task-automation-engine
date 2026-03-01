@@ -298,7 +298,8 @@ ${consolidatedReport}
    \`\`\`
 
 2. **Create Pull Request**
-   - Navigate to: https://github.com/jeferson0306/task-automation-engine/compare/${context.branchName}
+   - Create PR from your repository's web interface
+   - Compare: \`main\` <- \`${context.branchName}\`
    - Title: ${context.task.title}
    - Description: See consolidated report
 
