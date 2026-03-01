@@ -2,6 +2,7 @@ import path from 'path';
 import { logger } from '../utils/logger.js';
 import { ExecutionContext, Task, ProjectSnapshot, AntiPattern, XRayReport, ContractContext } from '../core/types.js';
 import { TaskVerificationResult, AIGuidance } from './TaskVerifier.js';
+import ProjectConventionsAnalyzer, { ProjectConventions } from './ProjectConventionsAnalyzer.js';
 
 /**
  * Complete AI instruction set
@@ -26,6 +27,29 @@ export interface AIInstructionSet {
     testFramework: string;
     buildTool: string;
     relevantPatterns: string[];
+  };
+
+  // Project conventions (learned from the codebase)
+  conventions?: {
+    formatting: {
+      indentation: string;
+      lineEnding: string;
+    };
+    naming: {
+      classes: string;
+      methods: string;
+      constants: string;
+    };
+    logging: {
+      framework: string;
+      pattern: string;
+      levels: string[];
+    };
+    errorHandling: {
+      pattern: string;
+      logsOnError: boolean;
+    };
+    similarCode?: string;
   };
 
   // Task requirements
@@ -124,6 +148,16 @@ export class AIGuidanceGenerator {
     const snapshot = context.projectSnapshot!;
     const task = context.task;
 
+    // Analyze project conventions (LEARN from the codebase)
+    const conventions = await ProjectConventionsAnalyzer.analyze(
+      context.workingDir,
+      snapshot,
+      {
+        keywords: verification.codeReferences?.patterns || [],
+        relatedEntities: verification.relatedFiles.map(f => path.basename(f).replace(/\.[^.]+$/, '')),
+      }
+    );
+
     const instructionSet: AIInstructionSet = {
       taskId: task.taskId,
       taskTitle: task.title,
@@ -131,17 +165,47 @@ export class AIGuidanceGenerator {
 
       summary: this.generateSummary(verification, taskDescription),
       projectContext: this.generateProjectContext(context, snapshot),
+      conventions: this.formatConventions(conventions),
       requirements: this.generateRequirements(task, taskDescription, verification),
       implementation: this.generateImplementationGuidance(context, verification, taskDescription),
       testing: this.generateTestingGuidance(context, verification, taskDescription),
       validation: this.generateValidationSteps(context, snapshot),
       steps: this.generateStepByStep(verification, context, taskDescription),
       warnings: this.generateWarnings(verification, context),
-      notes: this.generateNotes(verification, context),
+      notes: this.generateNotes(verification, context, conventions),
     };
 
     logger.info('AI instruction set generated');
     return instructionSet;
+  }
+
+  /**
+   * Format conventions for inclusion in instruction set
+   */
+  private formatConventions(conventions: ProjectConventions): AIInstructionSet['conventions'] {
+    return {
+      formatting: {
+        indentation: `${conventions.formatting.indentation.type}${conventions.formatting.indentation.size ? ` (${conventions.formatting.indentation.size})` : ''}`,
+        lineEnding: conventions.formatting.lineEnding.type,
+      },
+      naming: {
+        classes: conventions.naming.classes.pattern,
+        methods: conventions.naming.methods.pattern,
+        constants: conventions.naming.constants.pattern,
+      },
+      logging: {
+        framework: conventions.logging.framework.name,
+        pattern: conventions.logging.messagePatterns.pattern,
+        levels: conventions.logging.levelsUsed,
+      },
+      errorHandling: {
+        pattern: conventions.errorHandling.pattern,
+        logsOnError: conventions.errorHandling.logsOnError,
+      },
+      similarCode: conventions.similarImplementations.length > 0
+        ? conventions.similarImplementations[0].code
+        : undefined,
+    };
   }
 
   /**
@@ -173,6 +237,38 @@ export class AIGuidanceGenerator {
     md += `- **Framework:** ${instructionSet.projectContext.framework}\n`;
     md += `- **Test Framework:** ${instructionSet.projectContext.testFramework}\n`;
     md += `- **Build Tool:** ${instructionSet.projectContext.buildTool}\n\n`;
+
+    // Project Conventions (learned from codebase)
+    if (instructionSet.conventions) {
+      md += `## Project Conventions (Follow These!)\n\n`;
+      md += `> These conventions were learned from analyzing the existing codebase.\n\n`;
+      
+      md += `### Formatting\n`;
+      md += `- **Indentation:** ${instructionSet.conventions.formatting.indentation}\n`;
+      md += `- **Line Ending:** ${instructionSet.conventions.formatting.lineEnding}\n\n`;
+      
+      md += `### Naming\n`;
+      md += `- **Classes:** ${instructionSet.conventions.naming.classes}\n`;
+      md += `- **Methods:** ${instructionSet.conventions.naming.methods}\n`;
+      md += `- **Constants:** ${instructionSet.conventions.naming.constants}\n\n`;
+      
+      md += `### Logging\n`;
+      md += `- **Framework:** ${instructionSet.conventions.logging.framework}\n`;
+      md += `- **Pattern:** ${instructionSet.conventions.logging.pattern}\n`;
+      if (instructionSet.conventions.logging.levels.length > 0) {
+        md += `- **Levels Used:** ${instructionSet.conventions.logging.levels.join(', ')}\n`;
+      }
+      md += '\n';
+      
+      md += `### Error Handling\n`;
+      md += `- **Pattern:** ${instructionSet.conventions.errorHandling.pattern}\n`;
+      md += `- **Log on Error:** ${instructionSet.conventions.errorHandling.logsOnError ? 'Yes' : 'No'}\n\n`;
+      
+      if (instructionSet.conventions.similarCode) {
+        md += `### Similar Implementation (Reference)\n`;
+        md += `\`\`\`\n${instructionSet.conventions.similarCode.substring(0, 800)}\n\`\`\`\n\n`;
+      }
+    }
 
     // Requirements
     md += `## Requirements\n`;
@@ -655,7 +751,11 @@ export class AIGuidanceGenerator {
     return warnings;
   }
 
-  private generateNotes(verification: TaskVerificationResult, context: ExecutionContext): string[] {
+  private generateNotes(
+    verification: TaskVerificationResult, 
+    context: ExecutionContext,
+    conventions?: ProjectConventions
+  ): string[] {
     const notes: string[] = [];
 
     if (verification.status === 'IMPLEMENTED_NOT_COMMITTED') {
@@ -664,6 +764,25 @@ export class AIGuidanceGenerator {
 
     if (verification.evidence.some(e => e.type === 'task_reference' && e.file === 'git-history')) {
       notes.push('Task was previously referenced in git history');
+    }
+
+    // Add convention-based notes
+    if (conventions) {
+      if (conventions.logging.framework.name !== 'unknown') {
+        notes.push(`Use ${conventions.logging.framework.name} for logging (follow existing patterns)`);
+      }
+      
+      if (conventions.errorHandling.logsOnError) {
+        notes.push('Remember to log errors in catch blocks (project convention)');
+      }
+
+      if (conventions.codeStructure.documentationStyle.hasJavadoc) {
+        notes.push('Add Javadoc/documentation following project style');
+      }
+
+      if (conventions.similarImplementations.length > 0) {
+        notes.push(`Reference similar implementation: ${conventions.similarImplementations[0].methodName}`);
+      }
     }
 
     return notes;
