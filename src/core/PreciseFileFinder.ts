@@ -78,8 +78,9 @@ export class PreciseFileFinder {
     let match;
     while ((match = classPattern.exec(description)) !== null) {
       const className = match[1];
-      // Filter out common words that look like classes
-      if (!['OrderDate', 'MasterFile', 'DeliveryDate'].includes(className)) {
+      // Filter out common English compound words that look like class names
+      const commonCompoundWords = ['StartDate', 'EndDate', 'FirstName', 'LastName', 'UserName', 'DateTime'];
+      if (!commonCompoundWords.includes(className)) {
         if (!references.classes.includes(className)) {
           references.classes.push(className);
         }
