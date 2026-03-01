@@ -1,6 +1,6 @@
 import { Command, OptionValues } from 'commander';
 import { logger } from './utils/logger.js';
-import { readJson, writeFile } from './utils/file-utils.js';
+import { readJson, writeFile, readFile, fileExists } from './utils/file-utils.js';
 import taskParser from './core/TaskParser.js';
 import { runAnalysisWorkflow } from './workflows/analysis-workflow.js';
 import ProjectScanner from './analyzers/ProjectScanner.js';
@@ -10,6 +10,7 @@ import AntiPatternDetector from './analyzers/AntiPatternDetector.js';
 import SelfHealingPipeline from './analyzers/SelfHealingPipeline.js';
 import TaskVerifier from './analyzers/TaskVerifier.js';
 import AIGuidanceGenerator from './analyzers/AIGuidanceGenerator.js';
+import AgentOrchestrator from './core/AgentOrchestrator.js';
 import AutoCodeReviewer from './reviewers/AutoCodeReviewer.js';
 import SecurityReviewer from './reviewers/SecurityReviewer.js';
 import PerformanceReviewer from './reviewers/PerformanceReviewer.js';
@@ -55,9 +56,111 @@ program
   .description('Automate 100% of your development workflow - from task to commit-ready code')
   .version('0.1.0');
 
+// ============================================================================
+// MAIN COMMAND: task - The intelligent entry point
+// ============================================================================
+
+program
+  .command('task')
+  .description('Process any task automatically - just describe what needs to be done')
+  .argument('[description...]', 'Task description (or use --file for file input)')
+  .option('-p, --project <path>', 'Path to target project', process.cwd())
+  .option('-f, --file <path>', 'Read task from file (JSON, CSV, or text)')
+  .option('--quick', 'Quick analysis only (faster, less detailed)')
+  .action(async (descriptionParts: string[], options: OptionValues) => {
+    try {
+      let taskInput: string;
+
+      // Get task input from file or arguments
+      if (options.file) {
+        if (!await fileExists(options.file)) {
+          logger.error(`File not found: ${options.file}`);
+          process.exit(1);
+        }
+        taskInput = await readFile(options.file);
+        logger.info(`📄 Reading task from: ${options.file}`);
+      } else if (descriptionParts.length > 0) {
+        taskInput = descriptionParts.join(' ');
+      } else {
+        logger.error('❌ Please provide a task description or use --file');
+        logger.info('\nUsage:');
+        logger.info('  task "Fix the login validation bug"');
+        logger.info('  task --file ./task.json -p ./my-project');
+        logger.info('  task "Add pagination to user list" -p ./backend');
+        process.exit(1);
+      }
+
+      const projectPath = path.resolve(options.project);
+      
+      logger.info('');
+      logger.info('╔════════════════════════════════════════════════════════════╗');
+      logger.info('║          TASK AUTOMATION ENGINE - INTELLIGENT MODE         ║');
+      logger.info('╚════════════════════════════════════════════════════════════╝');
+      logger.info('');
+
+      if (options.quick) {
+        // Quick analysis mode
+        logger.info('🚀 Running quick analysis...\n');
+        const result = await AgentOrchestrator.quickAnalysis(taskInput, projectPath);
+        
+        logger.info('Quick Analysis Result:');
+        logger.info(`  Type: ${result.taskType}`);
+        logger.info(`  Likely Implemented: ${result.isLikelyImplemented ? 'YES' : 'NO'}`);
+        logger.info(`  Confidence: ${result.confidence}%`);
+        logger.info(`  Summary: ${result.summary}`);
+      } else {
+        // Full processing
+        const response = await AgentOrchestrator.process(taskInput, projectPath);
+        
+        // Display results
+        logger.info('\n' + '─'.repeat(60));
+        logger.info('RESULTS');
+        logger.info('─'.repeat(60));
+        
+        const actionIcons: Record<string, string> = {
+          'implement': '🔨',
+          'complete': '🔧',
+          'review': '👀',
+          'test': '🧪',
+          'fix': '🔧',
+          'inform': 'ℹ️',
+          'investigate': '🔍',
+        };
+        
+        logger.info(`\n${actionIcons[response.decision.action] || '📋'} Action: ${response.decision.action.toUpperCase()}`);
+        logger.info(`📊 Confidence: ${response.decision.confidence}%`);
+        logger.info(`📈 Complexity: ${response.decision.details.estimatedComplexity}`);
+        logger.info(`\n💭 Reasoning: ${response.decision.reasoning}`);
+        
+        if (response.decision.details.risks.length > 0) {
+          logger.info('\n⚠️  Risks:');
+          response.decision.details.risks.forEach(r => logger.info(`   - ${r}`));
+        }
+        
+        logger.info('\n📋 Next Steps:');
+        response.nextSteps.forEach((step, i) => logger.info(`   ${i + 1}. ${step}`));
+        
+        logger.info('\n📁 Reports Generated:');
+        logger.info(`   - Summary: ${response.reports.summary}`);
+        if (response.reports.guidance) {
+          logger.info(`   - Guidance: ${response.reports.guidance}`);
+        }
+      }
+      
+      logger.info('');
+    } catch (error) {
+      logger.error('Error:', error);
+      process.exit(1);
+    }
+  });
+
+// ============================================================================
+// LEGACY COMMANDS (for specific use cases)
+// ============================================================================
+
 program
   .command('run')
-  .description('Run full automation workflow')
+  .description('Run full automation workflow (legacy)')
   .option('-t, --task-file <path>', 'Path to task JSON file')
   .option('--task-id <id>', 'Task ID')
   .option('--task-title <title>', 'Task title')
@@ -746,28 +849,46 @@ function generateVerificationReport(verification: any): string {
 
 program
   .command('init')
-  .description('Initialize a new project')
+  .description('Show help and available commands')
   .action(() => {
     logger.info('╔════════════════════════════════════════════════════════════╗');
-    logger.info('║           TASK AUTOMATION ENGINE - INITIALIZED            ║');
+    logger.info('║              TASK AUTOMATION ENGINE v0.1.0                 ║');
     logger.info('╚════════════════════════════════════════════════════════════╝');
-    logger.info('\n✅ Dependencies ready\n');
-    logger.info('Available Commands:');
-    logger.info('  verify-task - Verify if a task is implemented (NEW!)');
-    logger.info('  analyze     - Full analysis workflow (scan + xray + contracts + antipatterns)');
-    logger.info('  scan        - Deep project scan with skeletal reading');
-    logger.info('  xray        - X-Ray analysis with specialist perspectives');
-    logger.info('  contracts   - Extract enums, exceptions, HTTP endpoints, services');
-    logger.info('  antipatterns- Detect 35+ anti-patterns');
-    logger.info('  review      - Code review (quality + security + performance)');
-    logger.info('  heal        - Self-healing pipeline');
-    logger.info('  run         - Full automation workflow');
-    logger.info('\nExamples:');
-    logger.info('  npm run dev -- verify-task -p ./my-project --task-id PROJ-123 --task-desc "Add validation to user input"');
-    logger.info('  npm run dev -- scan -p ./my-project --report');
-    logger.info('  npm run dev -- analyze -p ./my-project --task-desc "Add user authentication"');
-    logger.info('  npm run dev -- xray -p ./my-project -t "Implement caching layer"');
-    logger.info('  npm run dev -- review -p ./my-project --security --report');
+    logger.info('');
+    logger.info('🚀 MAIN COMMAND (Recommended):');
+    logger.info('');
+    logger.info('  task "description"     Process any task automatically');
+    logger.info('');
+    logger.info('  The agent will:');
+    logger.info('    1. Understand what you need (feature, bug fix, etc)');
+    logger.info('    2. Analyze the target project');
+    logger.info('    3. Check if it is already implemented');
+    logger.info('    4. Decide what action to take');
+    logger.info('    5. Generate guidance or inform status');
+    logger.info('');
+    logger.info('📋 Examples:');
+    logger.info('');
+    logger.info('  # Simple task description');
+    logger.info('  npm start -- task "Fix the login validation bug" -p ./my-project');
+    logger.info('');
+    logger.info('  # From file (supports JSON, CSV, or text)');
+    logger.info('  npm start -- task --file ./task.json -p ./my-project');
+    logger.info('');
+    logger.info('  # Quick check');
+    logger.info('  npm start -- task "Add user pagination" -p ./backend --quick');
+    logger.info('');
+    logger.info('─'.repeat(60));
+    logger.info('');
+    logger.info('🔧 Other Commands (for specific use cases):');
+    logger.info('');
+    logger.info('  analyze      Full analysis workflow');
+    logger.info('  scan         Deep project scan');
+    logger.info('  xray         Specialist perspectives analysis');
+    logger.info('  contracts    Extract code contracts');
+    logger.info('  antipatterns Detect anti-patterns');
+    logger.info('  review       Code review (quality/security/performance)');
+    logger.info('  heal         Self-healing pipeline');
+    logger.info('  verify-task  Check if task is implemented');
     logger.info('');
   });
 
