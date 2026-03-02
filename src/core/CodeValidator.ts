@@ -187,9 +187,26 @@ export class CodeValidator {
     
     let match;
 
+    // Helper to extract property from dot notation (e.g., "order.createdAt" -> "createdAt")
+    // This is CRITICAL because task descriptions use object.property but code may use different object names
+    const extractProperty = (pattern: string): string => {
+      // If pattern contains a dot, extract just the property part
+      if (pattern.includes('.')) {
+        const parts = pattern.split('.');
+        const property = parts[parts.length - 1]; // Get last part: "createdAt"
+        if (property && property.length > 2) {
+          return property;
+        }
+      }
+      return pattern;
+    };
+
     // Helper to add bug indicator with deduplication and filtering
     const addBugIndicator = (pattern: string, description: string) => {
-      const clean = this.cleanValue(pattern);
+      // Extract property from dot notation BEFORE cleaning
+      const property = extractProperty(pattern);
+      const clean = this.cleanValue(property);
+      
       // Skip if it's a method name or common word
       if (clean.length > 2 && !seenBugPatterns.has(clean) && !ignoredPatterns.has(clean)) {
         seenBugPatterns.add(clean);
@@ -198,12 +215,16 @@ export class CodeValidator {
           pattern: clean,
           description,
         });
+        logger.debug(`  Added bug indicator: "${pattern}" -> "${clean}"`);
       }
     };
 
     // Helper to add fix indicator with deduplication and filtering
     const addFixIndicator = (pattern: string, description: string) => {
-      const clean = this.cleanValue(pattern);
+      // Extract property from dot notation BEFORE cleaning
+      const property = extractProperty(pattern);
+      const clean = this.cleanValue(property);
+      
       // Skip if it's a method name or common word (but keep property names like createdAt)
       if (clean.length > 2 && !seenFixPatterns.has(clean) && !ignoredPatterns.has(clean)) {
         seenFixPatterns.add(clean);
@@ -212,6 +233,7 @@ export class CodeValidator {
           pattern: clean,
           description,
         });
+        logger.debug(`  Added fix indicator: "${pattern}" -> "${clean}"`);
       }
     };
 
