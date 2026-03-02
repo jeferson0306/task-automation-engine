@@ -211,6 +211,31 @@ export class AgentOrchestrator {
           logger.info(`   Total references: ${crossReferences.summary.totalReferences}`);
           logger.info(`   Cross-project refs: ${crossReferences.summary.crossProjectRefs}`);
         }
+        
+        // CRITICAL: Check for layer mismatch and suggest correct project
+        if (investigation.understanding.layer === 'frontend') {
+          const currentProjectType = workspace.projects.find(p => projectPath.includes(p.path))?.type;
+          if (currentProjectType === 'backend' || currentProjectType === 'api') {
+            // Find frontend projects in workspace
+            const frontendProjects = workspace.projects.filter(p => 
+              p.type === 'frontend' || 
+              p.name.toLowerCase().includes('ui') ||
+              p.name.toLowerCase().includes('web') ||
+              p.name.toLowerCase().includes('frontend')
+            );
+            
+            if (frontendProjects.length > 0) {
+              logger.warn('\n' + '🚨'.repeat(30));
+              logger.warn('🚨 LAYER MISMATCH DETECTED! 🚨');
+              logger.warn(`🚨 Task appears to be a FRONTEND bug but you're analyzing BACKEND!`);
+              logger.warn(`🚨 Suggested frontend project(s):`);
+              frontendProjects.forEach(p => {
+                logger.warn(`🚨   → ${p.name} (${p.path})`);
+              });
+              logger.warn('🚨'.repeat(30) + '\n');
+            }
+          }
+        }
       }
       
       // Step 7: Make decision (enhanced with investigation results)
@@ -645,8 +670,31 @@ export class AgentOrchestrator {
     
     // Add risks from investigation
     if (investigation) {
+      // CRITICAL: Detect layer mismatch
+      const detectedLayer = investigation.understanding.layer;
+      const currentProjectLang = context.language.toLowerCase();
+      const isCurrentProjectBackend = ['java', 'kotlin', 'python', 'go', 'c#'].some(lang => 
+        currentProjectLang.includes(lang)
+      );
+      const isCurrentProjectFrontend = ['typescript', 'javascript'].some(lang => 
+        currentProjectLang.includes(lang)
+      ) && (context.framework.toLowerCase().includes('angular') || 
+            context.framework.toLowerCase().includes('react') ||
+            context.framework.toLowerCase().includes('vue'));
+      
+      // CRITICAL WARNING: Task is frontend but we're analyzing backend
+      if (detectedLayer === 'frontend' && isCurrentProjectBackend && !isCurrentProjectFrontend) {
+        risks.unshift('🔴 CRITICAL MISMATCH: Task appears to be a FRONTEND bug but you are analyzing a BACKEND project!');
+        risks.unshift('🔴 Look for a frontend project (e.g., *-ui, *-web, *-frontend) in the workspace');
+      }
+      
+      // Warning: Task is backend but we're analyzing frontend
+      if (detectedLayer === 'backend' && isCurrentProjectFrontend && !isCurrentProjectBackend) {
+        risks.unshift('⚠️ MISMATCH: Task appears to be a BACKEND bug but you are analyzing a FRONTEND project');
+      }
+      
       // Multiple layers affected
-      if (investigation.understanding.layer === 'multiple') {
+      if (detectedLayer === 'multiple') {
         risks.push('Multiple layers affected (frontend/backend) - ensure consistency');
       }
       
@@ -764,10 +812,37 @@ export class AgentOrchestrator {
     const task = decision.details.taskUnderstanding;
     const context = decision.details.projectContext;
     
+    // Check for critical alerts
+    const criticalRisks = decision.details.risks.filter(r => r.includes('CRITICAL') || r.includes('MISMATCH'));
+    const hasCriticalAlerts = criticalRisks.length > 0;
+    
+    // Detect layer for display
+    const detectedLayer = investigation?.understanding.layer || 'unknown';
+    
     let report = `# Task Analysis Report
 
 > Task: ${task.id || 'N/A'} | Generated: ${new Date().toISOString()}
+`;
 
+    // Add critical alerts section at the very top if needed
+    if (hasCriticalAlerts) {
+      report += `
+## 🚨 CRITICAL ALERTS
+
+${criticalRisks.map(r => `**${r}**`).join('\n\n')}
+
+---
+`;
+    }
+
+    // Add layer detection info
+    if (detectedLayer !== 'unknown') {
+      report += `
+> **Detected Layer**: ${detectedLayer.toUpperCase()} | **Current Project**: ${context.language} / ${context.framework}
+`;
+    }
+
+    report += `
 ## Status: ${verification.status} (${verification.confidence}% confidence)
 
 **Action Required**: ${decision.action.toUpperCase()}

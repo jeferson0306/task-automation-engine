@@ -476,6 +476,63 @@ export class DataFlowTracer {
       }
     }
     
+    // ADDITIONAL CHECK: Look for function names that suggest duplicate logic
+    // This catches cases like "addWorkingDays" in both frontend and backend
+    const functionNamePatterns = [
+      /add\w*Days/i,
+      /add\w*Weeks/i,
+      /calculate\w*Date/i,
+      /get\w*Due\w*Date/i,
+      /estimate\w*Date/i,
+      /working\s*Days/i,
+    ];
+    
+    const functionLocations = new Map<string, DataLocation[]>();
+    
+    for (const dp of dataPoints) {
+      const content = dp.transformations.map(t => t.code).join(' ') + ' ' + dp.name;
+      
+      for (const pattern of functionNamePatterns) {
+        const match = pattern.exec(content);
+        if (match) {
+          const funcName = match[0].toLowerCase().replace(/\s+/g, '');
+          if (!functionLocations.has(funcName)) {
+            functionLocations.set(funcName, []);
+          }
+          functionLocations.get(funcName)!.push(dp.location);
+        }
+      }
+    }
+    
+    // Report functions that appear in multiple projects
+    for (const [funcName, locations] of functionLocations) {
+      // Deduplicate by project
+      const uniqueByProject = new Map<string, DataLocation>();
+      for (const loc of locations) {
+        if (!uniqueByProject.has(loc.project)) {
+          uniqueByProject.set(loc.project, loc);
+        }
+      }
+      
+      if (uniqueByProject.size >= 2) {
+        const uniqueLocs = Array.from(uniqueByProject.values());
+        const projectList = uniqueLocs.map(l => l.project).join(', ');
+        
+        // Check if in different layers (frontend vs backend)
+        const layers = new Set(uniqueLocs.map(l => l.layer));
+        const inDifferentLayers = layers.size >= 2;
+        
+        duplicates.push({
+          description: inDifferentLayers
+            ? `⚠️ CRITICAL: "${funcName}" function exists in BOTH frontend AND backend (${projectList}). This may cause calculation inconsistencies!`
+            : `Similar function "${funcName}" found in ${uniqueByProject.size} projects (${projectList})`,
+          locations: uniqueLocs,
+          similarity: inDifferentLayers ? 95 : 75,
+          risk: inDifferentLayers ? 'high' : 'medium',
+        });
+      }
+    }
+    
     return duplicates;
   }
   

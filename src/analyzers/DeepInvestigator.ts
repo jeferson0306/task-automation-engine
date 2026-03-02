@@ -182,16 +182,54 @@ export class DeepInvestigator {
       type = 'improvement';
     }
     
-    // Determine layer
+    // Determine layer with more sophisticated analysis
     let layer: TaskUnderstanding['layer'] = 'unknown';
-    if (this.matchesPatterns(fullText, ['page', 'view', 'component', 'ui', 'display', 'screen', 'frontend', 'angular', 'react'])) {
+    
+    // Strong frontend indicators - these suggest the bug is ONLY in frontend
+    const strongFrontendIndicators = [
+      'restricted to the', 'only in the', 'only on the',  // "restricted to the Catalogue Details page"
+      'works correctly in', 'works in',                   // "In Orders view it works correctly"
+      'not in the',                                        // Implies issue is NOT in some other place
+    ];
+    
+    // Check for exclusive frontend patterns
+    const hasExclusiveFrontend = strongFrontendIndicators.some(pattern => fullText.includes(pattern));
+    
+    // Standard frontend indicators
+    const frontendKeywords = ['page', 'view', 'component', 'ui', 'display', 'screen', 'frontend', 'angular', 'react', 'catalogue', 'catalog', 'details page'];
+    const hasFrontendKeywords = this.matchesPatterns(fullText, frontendKeywords);
+    
+    // Backend indicators  
+    const backendKeywords = ['service', 'backend', 'server', 'endpoint', 'controller', 'repository', 'dao'];
+    const hasBackendKeywords = this.matchesPatterns(fullText, backendKeywords);
+    
+    // Specific method/class mentioned (suggests backend)
+    const hasSpecificCode = /\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\.[a-z]+\(/i.test(fullText);  // e.g., "OrderUtils.generateEstimatedDate()"
+    
+    // Database indicators
+    const hasDatabaseKeywords = this.matchesPatterns(fullText, ['database', 'table', 'column', 'migration', 'entity', 'sql']);
+    
+    // Determine layer based on analysis
+    if (hasExclusiveFrontend && hasFrontendKeywords && !hasSpecificCode) {
+      // Strong indication this is frontend-only
+      layer = 'frontend';
+    } else if (hasFrontendKeywords && !hasBackendKeywords && !hasSpecificCode) {
+      layer = 'frontend';
+    } else if (hasBackendKeywords || hasSpecificCode) {
+      layer = hasFrontendKeywords ? 'multiple' : 'backend';
+    } else if (hasDatabaseKeywords) {
+      layer = 'database';
+    } else if (hasFrontendKeywords) {
       layer = 'frontend';
     }
-    if (this.matchesPatterns(fullText, ['service', 'backend', 'server', 'api', 'endpoint', 'controller'])) {
-      layer = layer === 'frontend' ? 'multiple' : 'backend';
-    }
-    if (this.matchesPatterns(fullText, ['database', 'table', 'column', 'migration', 'entity'])) {
-      layer = layer !== 'unknown' ? 'multiple' : 'database';
+    
+    // Special case: if description says "works correctly" somewhere, the bug is likely NOT there
+    if (fullText.includes('works correctly') && layer === 'unknown') {
+      // Try to find what works correctly and invert
+      if (fullText.includes('orders') && fullText.includes('works correctly')) {
+        // Orders works -> bug is elsewhere (likely frontend page)
+        layer = 'frontend';
+      }
     }
     
     // Extract concepts
@@ -300,6 +338,57 @@ export class DeepInvestigator {
             type: 'calculation',
             importance: 'critical',
             searchTerms: this.generateSearchTerms(target),
+          });
+        }
+      }
+    }
+    
+    // Extract bug/fix indicators - CRITICAL for understanding what needs to change
+    const bugFixIndicators = [
+      // "use X instead of Y"
+      /use\s+([a-zA-Z_.]+)\s+instead\s+of\s+([a-zA-Z_.]+)/gi,
+      // "should be X not Y"
+      /should\s+(?:be|use)\s+([a-zA-Z_.]+)\s+(?:not|instead\s+of)\s+([a-zA-Z_.]+)/gi,
+      // "X is wrong" or "wrong X"
+      /(?:wrong|incorrect)\s+([a-zA-Z_.]+)/gi,
+      // "Today + X" or "now + X" patterns (date calculations)
+      /(today|now|current\s*date)\s*\+\s*(\d+\s*(?:day|week|month)s?)/gi,
+      // "when X is Y" (condition patterns)
+      /when\s+([a-zA-Z_]+)\s+is\s+([A-Z_]+)/gi,
+    ];
+    
+    for (const pattern of bugFixIndicators) {
+      let match;
+      while ((match = pattern.exec(fullText)) !== null) {
+        const indicator = match[0];
+        concepts.push({
+          name: indicator,
+          type: 'calculation',  // Bug indicators usually relate to calculations
+          importance: 'critical',
+          searchTerms: match.slice(1).filter(Boolean).map(s => s.trim()),
+        });
+      }
+    }
+    
+    // Extract specific function/method mentions (e.g., "getLODueDate()", "calculateDate")
+    const functionPatterns = [
+      /\b(get[A-Z][a-zA-Z]+)\b/g,           // getFoo, getLODueDate
+      /\b(calculate[A-Z][a-zA-Z]+)\b/g,     // calculateFoo
+      /\b(compute[A-Z][a-zA-Z]+)\b/g,       // computeFoo
+      /\b([a-z]+(?:Date|DueDate|DeliveryDate|EstimatedDate))\b/g, // specificDate
+      /\b([a-zA-Z]+Utils)\b/g,               // FooUtils, OrderUtils
+    ];
+    
+    for (const pattern of functionPatterns) {
+      let match;
+      while ((match = pattern.exec(description)) !== null) {
+        const name = match[1];
+        if (name.length > 4 && !this.isCommonWord(name)) {
+          concepts.push({
+            name,
+            type: 'calculation',
+            importance: 'critical',
+            searchTerms: this.generateSearchTerms(name),
           });
         }
       }
@@ -493,6 +582,36 @@ export class DeepInvestigator {
     const actions: RecommendedAction[] = [];
     let priority = 1;
     
+    // CRITICAL: If layer is frontend, recommend frontend files first
+    if (understanding.layer === 'frontend') {
+      // Find frontend-related findings
+      const frontendFindings = findings.filter(f => 
+        f.file.includes('ui') || 
+        f.file.endsWith('.ts') || 
+        f.file.endsWith('.tsx') ||
+        f.file.endsWith('.vue') ||
+        f.file.endsWith('.jsx')
+      );
+      
+      if (frontendFindings.length > 0) {
+        actions.push({
+          priority: priority++,
+          type: 'investigate',
+          description: '⚠️ FRONTEND BUG: Investigate frontend files first',
+          files: frontendFindings.slice(0, 5).map(f => f.file),
+          reason: 'Task description indicates bug is in frontend/UI layer',
+        });
+      } else {
+        actions.push({
+          priority: priority++,
+          type: 'investigate',
+          description: '⚠️ FRONTEND BUG: Look for frontend project (e.g., *-ui, *-web, *-frontend)',
+          files: [],
+          reason: 'Bug appears to be in frontend but no frontend files found in current project. Check other projects in workspace.',
+        });
+      }
+    }
+    
     // If duplicate logic found, recommend centralizing
     const duplicates = findings.filter(f => f.type === 'duplicate-logic');
     if (duplicates.length > 0) {
@@ -524,6 +643,17 @@ export class DeepInvestigator {
         description: 'Gather more information about the task requirements',
         files: [],
         reason: 'Task description lacks specific technical details',
+      });
+    }
+    
+    // If layer detected as frontend but current project is backend
+    if (understanding.layer === 'frontend') {
+      actions.push({
+        priority: priority++,
+        type: 'investigate',
+        description: 'Search for frontend project in workspace',
+        files: [],
+        reason: 'This task appears to be a frontend bug. Make sure you are analyzing the correct project.',
       });
     }
     
