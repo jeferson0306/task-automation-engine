@@ -116,6 +116,31 @@ export class CodeValidator {
       }
     }
 
+    // Handle compound patterns like "orderCreatedAt" - extract the property part
+    // This handles cases where task says "order.createdAt" but code has "entity.getCreatedAt()"
+    // Split on camelCase boundaries and try variations with just the property name
+    const camelParts = clean.split(/(?=[A-Z])/);
+    if (camelParts.length >= 2) {
+      // Try removing common prefixes like "order", "entity", "item", "user", etc.
+      const commonPrefixes = ['order', 'entity', 'item', 'user', 'request', 'response', 'data', 'input', 'output'];
+      const firstPart = camelParts[0].toLowerCase();
+      
+      if (commonPrefixes.includes(firstPart)) {
+        // Extract the property part: "orderCreatedAt" -> "createdAt"
+        const propertyPart = camelParts.slice(1).join('');
+        if (propertyPart.length > 2) {
+          const propLower = propertyPart.toLowerCase();
+          variations.push(propLower);
+          
+          // Add accessor variations for the property
+          const capitalizedProp = propertyPart.charAt(0).toUpperCase() + propertyPart.slice(1);
+          variations.push(('get' + capitalizedProp).toLowerCase());
+          variations.push(('set' + capitalizedProp).toLowerCase());
+          variations.push(('is' + capitalizedProp).toLowerCase());
+        }
+      }
+    }
+
     return [...new Set(variations)]; // Deduplicate
   }
 
