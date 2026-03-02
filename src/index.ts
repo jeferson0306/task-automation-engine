@@ -11,6 +11,10 @@ import SelfHealingPipeline from './analyzers/SelfHealingPipeline.js';
 import TaskVerifier from './analyzers/TaskVerifier.js';
 import AIGuidanceGenerator from './analyzers/AIGuidanceGenerator.js';
 import AgentOrchestrator from './core/AgentOrchestrator.js';
+import MultiProjectScanner from './analyzers/MultiProjectScanner.js';
+import DataFlowTracer from './analyzers/DataFlowTracer.js';
+import DeepInvestigator from './analyzers/DeepInvestigator.js';
+import CrossReferenceMapper from './analyzers/CrossReferenceMapper.js';
 import AutoCodeReviewer from './reviewers/AutoCodeReviewer.js';
 import SecurityReviewer from './reviewers/SecurityReviewer.js';
 import PerformanceReviewer from './reviewers/PerformanceReviewer.js';
@@ -71,6 +75,11 @@ program
   .option('--multi-report', 'Generate multiple report files (default: single combined)')
   .option('-o, --output <path>', 'Output directory for reports (default: project dir)')
   .option('-v, --verbose', 'Show detailed output')
+  .option('--no-deep', 'Disable deep investigation mode')
+  .option('--no-multiproject', 'Disable multi-project scanning')
+  .option('--no-dataflow', 'Disable data flow tracing')
+  .option('--crossref', 'Enable cross-reference mapping (expensive)')
+  .option('--threshold <n>', 'Confidence threshold for investigation (default: 50)', parseInt)
   .action(async (descriptionParts: string[], options: OptionValues) => {
     try {
       let taskInput: string;
@@ -119,6 +128,11 @@ program
           singleReportFile: !options.multiReport,
           reportOutputDir: options.output ? path.resolve(options.output) : undefined,
           verbose: options.verbose || false,
+          deepInvestigation: options.deep !== false,
+          multiProjectScan: options.multiproject !== false,
+          traceDataFlow: options.dataflow !== false,
+          crossReferenceMap: options.crossref || false,
+          investigationThreshold: options.threshold || 50,
         };
         
         const response = await AgentOrchestrator.process(taskInput, projectPath, agentOptions);
@@ -150,6 +164,28 @@ program
         
         logger.info('\n📋 Next Steps:');
         response.nextSteps.forEach((step, i) => logger.info(`   ${i + 1}. ${step}`));
+        
+        // Show investigation results if available
+        if (response.investigation) {
+          logger.info('\n🔬 Deep Investigation:');
+          logger.info(`   Concepts: ${response.investigation.understanding.concepts.map(c => c.name).slice(0, 5).join(', ')}`);
+          logger.info(`   Findings: ${response.investigation.findings.length}`);
+          logger.info(`   Uncertainties: ${response.investigation.uncertainties.length}`);
+        }
+        
+        if (response.dataFlow) {
+          logger.info('\n📊 Data Flow:');
+          logger.info(`   Data points: ${response.dataFlow.dataPoints.length}`);
+          logger.info(`   Flow paths: ${response.dataFlow.flowPaths.length}`);
+          if (response.dataFlow.duplicateLogic.length > 0) {
+            logger.info(`   ⚠️  DUPLICATE LOGIC: ${response.dataFlow.duplicateLogic.length} instances`);
+          }
+        }
+        
+        if (response.workspace && response.workspace.projects.length > 1) {
+          logger.info('\n🌐 Workspace:');
+          logger.info(`   Projects: ${response.workspace.projects.map(p => p.name).join(', ')}`);
+        }
         
         logger.info('\n📁 Reports Generated:');
         logger.info(`   - Summary: ${response.reports.summary}`);

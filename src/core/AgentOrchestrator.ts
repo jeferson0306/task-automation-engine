@@ -7,6 +7,10 @@ import TaskVerifier, { TaskVerificationResult } from '../analyzers/TaskVerifier.
 import AIGuidanceGenerator, { AIInstructionSet } from '../analyzers/AIGuidanceGenerator.js';
 import FilePolicy from './FilePolicy.js';
 import { ExecutionContext, ParsedTask, TaskStatus, ProjectSnapshot } from './types.js';
+import MultiProjectScanner, { Workspace, DetectedProject } from '../analyzers/MultiProjectScanner.js';
+import DataFlowTracer, { DataFlowTrace } from '../analyzers/DataFlowTracer.js';
+import DeepInvestigator, { InvestigationResult } from '../analyzers/DeepInvestigator.js';
+import CrossReferenceMapper, { CrossReferenceMap } from '../analyzers/CrossReferenceMapper.js';
 
 /**
  * Options for agent processing
@@ -17,6 +21,12 @@ export interface AgentOptions {
   singleReportFile?: boolean;
   skipBranchCreation?: boolean;
   verbose?: boolean;
+  // New options for deep analysis
+  deepInvestigation?: boolean;        // Enable full investigation mode
+  multiProjectScan?: boolean;         // Scan parent directory for all projects
+  traceDataFlow?: boolean;            // Trace data flow across layers
+  crossReferenceMap?: boolean;        // Build cross-reference map
+  investigationThreshold?: number;    // Confidence threshold to trigger investigation (default: 50)
 }
 
 /**
@@ -63,6 +73,11 @@ export interface AgentResponse {
     guidance?: string;
   };
   nextSteps: string[];
+  // Deep investigation results
+  investigation?: InvestigationResult;
+  dataFlow?: DataFlowTrace;
+  crossReferences?: CrossReferenceMap;
+  workspace?: Workspace;
 }
 
 /**
@@ -88,6 +103,11 @@ export class AgentOrchestrator {
     singleReportFile: true,  // Only generate ONE file by default
     skipBranchCreation: true, // Don't create branches automatically
     verbose: false,
+    deepInvestigation: true,  // Enable deep investigation by default
+    multiProjectScan: true,   // Scan for multiple projects
+    traceDataFlow: true,      // Trace data flow
+    crossReferenceMap: false, // Disabled by default (expensive)
+    investigationThreshold: 50, // Trigger investigation when confidence < 50%
   };
 
   /**
@@ -98,7 +118,7 @@ export class AgentOrchestrator {
     const opts = { ...this.defaultOptions, ...options };
     
     logger.info('═'.repeat(60));
-    logger.info('  AGENT ORCHESTRATOR - Precise Mode');
+    logger.info('  AGENT ORCHESTRATOR - Deep Investigation Mode');
     logger.info('═'.repeat(60));
     
     const startTime = Date.now();
@@ -109,17 +129,27 @@ export class AgentOrchestrator {
       const taskUnderstanding = TaskInputParser.parse(taskInput);
       this.logTaskUnderstanding(taskUnderstanding);
       
-      // Step 2: Analyze the project
-      logger.info('\n🔍 Step 2: Analyzing project (light scan)...');
+      // Step 2: Multi-project scan (if enabled)
+      let workspace: Workspace | undefined;
+      if (opts.multiProjectScan) {
+        logger.info('\n🌐 Step 2: Scanning workspace for all projects...');
+        const workspaceRoot = this.detectWorkspaceRoot(projectPath);
+        workspace = await MultiProjectScanner.scanWorkspace(workspaceRoot);
+        logger.info(`   Found ${workspace.projects.length} projects: ${workspace.projects.map(p => p.name).join(', ')}`);
+        logger.info(`   Relationships: ${workspace.relationships.length} cross-project dependencies`);
+      }
+      
+      // Step 3: Analyze the target project
+      logger.info('\n🔍 Step 3: Analyzing target project...');
       const projectSnapshot = await ProjectScanner.scan(projectPath);
       const projectContext = this.summarizeProjectContext(projectSnapshot, taskUnderstanding);
       this.logProjectContext(projectContext);
       
-      // Step 3: Create execution context
+      // Step 4: Create execution context
       const context = this.createContext(projectPath, taskUnderstanding, projectSnapshot);
       
-      // Step 4: Verify if task is already implemented (PRECISE mode)
-      logger.info('\n🔎 Step 3: Checking implementation status (precise)...');
+      // Step 5: Verify if task is already implemented (PRECISE mode)
+      logger.info('\n🔎 Step 4: Checking implementation status (precise)...');
       const verificationResult = await TaskVerifier.verify(context, taskUnderstanding.description);
       this.logVerificationResult(verificationResult);
       
@@ -131,23 +161,78 @@ export class AgentOrchestrator {
         }
       }
       
-      // Step 5: Make decision
-      logger.info('\n🧠 Step 4: Making decision...');
-      const decision = this.makeDecision(taskUnderstanding, projectContext, verificationResult);
+      // Step 6: Deep investigation (if enabled and confidence is low)
+      let investigation: InvestigationResult | undefined;
+      let dataFlow: DataFlowTrace | undefined;
+      let crossReferences: CrossReferenceMap | undefined;
+      
+      const needsDeepInvestigation = opts.deepInvestigation && (
+        verificationResult.confidence < (opts.investigationThreshold || 50) ||
+        verificationResult.status === 'NOT_IMPLEMENTED' ||
+        verificationResult.status === 'NEEDS_REVIEW'
+      );
+      
+      if (needsDeepInvestigation && workspace) {
+        logger.info('\n🔬 Step 5: Deep investigation triggered...');
+        
+        // Run deep investigation
+        investigation = await DeepInvestigator.investigate(
+          this.detectWorkspaceRoot(projectPath),
+          taskUnderstanding.id || 'TASK',
+          taskInput,
+          {
+            title: taskUnderstanding.title,
+            comments: [],
+          }
+        );
+        logger.info(`   Investigation confidence: ${investigation.confidence}%`);
+        logger.info(`   Findings: ${investigation.findings.length}`);
+        logger.info(`   Uncertainties: ${investigation.uncertainties.length}`);
+        
+        // Trace data flow for key concepts
+        if (opts.traceDataFlow && investigation.understanding.concepts.length > 0) {
+          logger.info('\n📊 Step 5b: Tracing data flow...');
+          const searchTerms = investigation.understanding.concepts
+            .filter(c => c.importance !== 'mentioned')
+            .flatMap(c => c.searchTerms)
+            .slice(0, 10);
+          
+          dataFlow = await DataFlowTracer.traceDataFlow(workspace, searchTerms, { taskDescription: taskInput });
+          logger.info(`   Data points: ${dataFlow.dataPoints.length}`);
+          logger.info(`   Flow paths: ${dataFlow.flowPaths.length}`);
+          logger.info(`   Duplicate logic: ${dataFlow.duplicateLogic.length}`);
+        }
+        
+        // Build cross-reference map (expensive, optional)
+        if (opts.crossReferenceMap) {
+          logger.info('\n🔗 Step 5c: Building cross-reference map...');
+          const focusTerms = investigation.understanding.concepts.map(c => c.name);
+          crossReferences = await CrossReferenceMapper.buildCrossReferenceMap(workspace, focusTerms);
+          logger.info(`   Total references: ${crossReferences.summary.totalReferences}`);
+          logger.info(`   Cross-project refs: ${crossReferences.summary.crossProjectRefs}`);
+        }
+      }
+      
+      // Step 7: Make decision (enhanced with investigation results)
+      logger.info('\n🧠 Step 6: Making decision...');
+      const decision = this.makeDecision(taskUnderstanding, projectContext, verificationResult, investigation, dataFlow);
       this.logDecision(decision);
       
-      // Step 6: Generate guidance if needed
+      // Step 8: Generate guidance if needed
       let instructions: AIInstructionSet | undefined;
       if (decision.action !== 'inform') {
-        logger.info('\n📝 Step 5: Generating guidance...');
+        logger.info('\n📝 Step 7: Generating guidance...');
         instructions = await AIGuidanceGenerator.generate(context, verificationResult, taskUnderstanding.description);
       }
       
-      // Step 7: Generate reports (single file by default)
-      const reports = await this.generateReports(projectPath, decision, verificationResult, instructions, opts);
+      // Step 9: Generate reports (enhanced with investigation data)
+      const reports = await this.generateReports(
+        projectPath, decision, verificationResult, instructions, opts,
+        investigation, dataFlow, workspace
+      );
       
-      // Step 8: Determine next steps
-      const nextSteps = this.determineNextSteps(decision, verificationResult);
+      // Step 10: Determine next steps (enhanced)
+      const nextSteps = this.determineNextSteps(decision, verificationResult, investigation, dataFlow);
       
       const duration = Date.now() - startTime;
       
@@ -160,6 +245,12 @@ export class AgentOrchestrator {
       if (verificationResult.preciseMatches.length > 0) {
         logger.info(`Precise matches: ${verificationResult.preciseMatches.length} files`);
       }
+      if (investigation) {
+        logger.info(`Investigation findings: ${investigation.findings.length}`);
+      }
+      if (dataFlow) {
+        logger.info(`Data flow paths: ${dataFlow.flowPaths.length}`);
+      }
       
       return {
         success: true,
@@ -167,12 +258,34 @@ export class AgentOrchestrator {
         instructions,
         reports,
         nextSteps,
+        investigation,
+        dataFlow,
+        crossReferences,
+        workspace,
       };
       
     } catch (error) {
       logger.error('Agent processing failed:', error);
       throw error;
     }
+  }
+
+  /**
+   * Detect the workspace root (parent directory with multiple projects)
+   */
+  private detectWorkspaceRoot(projectPath: string): string {
+    // Check if parent directory has multiple project subdirectories
+    const parentPath = path.dirname(projectPath);
+    const projectName = path.basename(projectPath);
+    
+    // If the project name contains common patterns, parent might be workspace
+    const workspaceIndicators = ['-api', '-ui', '-pms', '-tms', '-core', '-common', '-service'];
+    if (workspaceIndicators.some(ind => projectName.toLowerCase().includes(ind))) {
+      return parentPath;
+    }
+    
+    // Default to project path itself
+    return projectPath;
   }
 
   /**
@@ -321,7 +434,9 @@ export class AgentOrchestrator {
   private makeDecision(
     task: ParsedTaskInput,
     context: ProjectContextSummary,
-    verification: TaskVerificationResult
+    verification: TaskVerificationResult,
+    investigation?: InvestigationResult,
+    dataFlow?: DataFlowTrace
   ): AgentDecision {
     let action: AgentDecision['action'];
     let reasoning: string;
@@ -411,8 +526,41 @@ export class AgentOrchestrator {
       reasoning = 'This is a spike/investigation task. Research needed before implementation.';
     }
     
+    // Adjust based on deep investigation results
+    if (investigation) {
+      // If investigation found the bug in a different layer
+      if (investigation.understanding.layer !== 'unknown') {
+        reasoning += ` Layer detected: ${investigation.understanding.layer}.`;
+      }
+      
+      // If duplicate logic was found
+      if (dataFlow?.duplicateLogic && dataFlow.duplicateLogic.length > 0) {
+        reasoning += ` WARNING: Duplicate logic found in ${dataFlow.duplicateLogic.length} locations.`;
+        suggestedApproach.unshift('⚠️ Review duplicate logic across projects before making changes');
+      }
+      
+      // If investigation has low confidence
+      if (investigation.confidence < 50) {
+        action = 'investigate';
+        reasoning = `Investigation confidence is low (${investigation.confidence}%). More analysis needed.`;
+        suggestedApproach = [
+          ...investigation.uncertainties.map(u => `Clarify: ${u}`),
+          'Gather more context from stakeholders',
+          'Review related code manually',
+          ...suggestedApproach,
+        ];
+      }
+      
+      // Add investigation-based actions
+      for (const recAction of investigation.actions) {
+        if (!suggestedApproach.includes(recAction.description)) {
+          suggestedApproach.push(recAction.description);
+        }
+      }
+    }
+    
     const complexity = this.estimateComplexity(task, context, verification);
-    const risks = this.identifyRisks(task, context, verification);
+    const risks = this.identifyRisks(task, context, verification, investigation, dataFlow);
     
     return {
       action,
@@ -469,7 +617,9 @@ export class AgentOrchestrator {
   private identifyRisks(
     task: ParsedTaskInput,
     context: ProjectContextSummary,
-    verification: TaskVerificationResult
+    verification: TaskVerificationResult,
+    investigation?: InvestigationResult,
+    dataFlow?: DataFlowTrace
   ): string[] {
     const risks: string[] = [];
     
@@ -491,6 +641,38 @@ export class AgentOrchestrator {
     
     if (task.confidence < 70) {
       risks.push('Low confidence in task parsing - verify understanding');
+    }
+    
+    // Add risks from investigation
+    if (investigation) {
+      // Multiple layers affected
+      if (investigation.understanding.layer === 'multiple') {
+        risks.push('Multiple layers affected (frontend/backend) - ensure consistency');
+      }
+      
+      // Uncertainties from investigation
+      for (const uncertainty of investigation.uncertainties.slice(0, 3)) {
+        risks.push(`⚠️ ${uncertainty}`);
+      }
+    }
+    
+    // Add risks from data flow analysis
+    if (dataFlow) {
+      // Duplicate logic found
+      if (dataFlow.duplicateLogic.length > 0) {
+        risks.push(`🔴 CRITICAL: Same logic in ${dataFlow.duplicateLogic.length} locations - potential for inconsistent behavior`);
+      }
+      
+      // Frontend-only calculations
+      if (dataFlow.recommendations.some(r => r.includes('FRONTEND CALCULATION'))) {
+        risks.push('Business logic in frontend - may cause sync issues with backend');
+      }
+      
+      // Multi-project data
+      const projects = new Set(dataFlow.dataPoints.map(dp => dp.location.project));
+      if (projects.size >= 2) {
+        risks.push(`Changes may be needed in ${projects.size} projects: ${[...projects].join(', ')}`);
+      }
     }
     
     return risks;
@@ -520,7 +702,10 @@ export class AgentOrchestrator {
     decision: AgentDecision,
     verification: TaskVerificationResult,
     instructions?: AIInstructionSet,
-    options?: AgentOptions
+    options?: AgentOptions,
+    investigation?: InvestigationResult,
+    dataFlow?: DataFlowTrace,
+    workspace?: Workspace
   ): Promise<AgentResponse['reports']> {
     if (options?.generateReports === false) {
       return { summary: '' };
@@ -531,7 +716,9 @@ export class AgentOrchestrator {
     
     // Single combined report (default)
     if (options?.singleReportFile !== false) {
-      const combinedReport = this.generateCombinedReport(decision, verification, instructions);
+      const combinedReport = this.generateCombinedReport(
+        decision, verification, instructions, investigation, dataFlow, workspace
+      );
       const reportPath = path.join(outputDir, `task-analysis-${taskId}.md`);
       await writeFile(reportPath, combinedReport);
       
@@ -569,7 +756,10 @@ export class AgentOrchestrator {
   private generateCombinedReport(
     decision: AgentDecision,
     verification: TaskVerificationResult,
-    instructions?: AIInstructionSet
+    instructions?: AIInstructionSet,
+    investigation?: InvestigationResult,
+    dataFlow?: DataFlowTrace,
+    workspace?: Workspace
   ): string {
     const task = decision.details.taskUnderstanding;
     const context = decision.details.projectContext;
@@ -678,9 +868,109 @@ ${validationChecks.slice(0, 5).map((v: string) => `- [ ] ${v}`).join('\n')}
 `;
     }
 
+    // Add workspace analysis section if available
+    if (workspace && workspace.projects.length > 1) {
+      report += `
+---
+
+## Workspace Analysis
+
+**Workspace Root**: ${workspace.rootPath}
+
+### Projects Found (${workspace.projects.length})
+| Project | Type | Language | Framework |
+|---------|------|----------|-----------|
+${workspace.projects.map(p => 
+  `| ${p.name} | ${p.type} | ${p.language} | ${p.framework || '-'} |`
+).join('\n')}
+
+### Cross-Project Dependencies
+${workspace.relationships.length > 0 
+  ? workspace.relationships.slice(0, 10).map(r => `- ${r.from} → ${r.to} (${r.type})`).join('\n')
+  : '_No cross-project dependencies detected_'}
+`;
+    }
+
+    // Add deep investigation section if available
+    if (investigation) {
+      report += `
+---
+
+## Deep Investigation Results
+
+**Investigation Confidence**: ${investigation.confidence}%
+
+### Task Understanding
+- **Type**: ${investigation.understanding.type}
+- **Layer**: ${investigation.understanding.layer}
+- **Expected Behavior**: ${investigation.understanding.expectedBehavior || '_Not specified_'}
+- **Actual Behavior**: ${investigation.understanding.actualBehavior || '_Not specified_'}
+
+### Extracted Concepts
+${investigation.understanding.concepts.length > 0
+  ? investigation.understanding.concepts.slice(0, 10).map(c => 
+    `- **${c.name}** (${c.type}, ${c.importance})`
+  ).join('\n')
+  : '_No specific concepts extracted_'}
+
+### Code Findings (${investigation.findings.length})
+${investigation.findings.slice(0, 8).map(f => 
+  `- **[${f.severity.toUpperCase()}]** ${f.type}: ${f.description}
+    - File: \`${f.file}\`${f.recommendation ? `\n    - Recommendation: ${f.recommendation}` : ''}`
+).join('\n') || '_No findings_'}
+
+### Uncertainties
+${investigation.uncertainties.length > 0
+  ? investigation.uncertainties.map(u => `- ❓ ${u}`).join('\n')
+  : '_No uncertainties identified_'}
+
+### Recommended Actions
+${investigation.actions.slice(0, 5).map((a, i) => 
+  `${i + 1}. **[${a.type.toUpperCase()}]** ${a.description}
+     - Reason: ${a.reason}
+     - Files: ${a.files.length > 0 ? a.files.slice(0, 3).map(f => `\`${path.basename(f)}\``).join(', ') : '_none_'}`
+).join('\n') || '_No actions recommended_'}
+`;
+    }
+
+    // Add data flow analysis section if available
+    if (dataFlow) {
+      report += `
+---
+
+## Data Flow Analysis
+
+**Query**: ${dataFlow.query}
+
+### Data Points Found (${dataFlow.dataPoints.length})
+${dataFlow.dataPoints.slice(0, 10).map(dp => 
+  `- \`${dp.name}\` in **${dp.location.project}** → ${dp.location.layer} layer
+    - File: \`${dp.location.file}\`${dp.location.line ? `:${dp.location.line}` : ''}`
+).join('\n') || '_No data points found_'}
+
+### Flow Paths (${dataFlow.flowPaths.length})
+${dataFlow.flowPaths.map(fp => 
+  `**${fp.description}**
+${fp.steps.map(s => `  ${s.order}. ${s.project}: ${s.action}`).join('\n')}`
+).join('\n\n') || '_No flow paths detected_'}
+
+${dataFlow.duplicateLogic.length > 0 ? `
+### ⚠️ DUPLICATE LOGIC DETECTED (${dataFlow.duplicateLogic.length})
+
+${dataFlow.duplicateLogic.map(dup => 
+  `**${dup.description}** (Risk: ${dup.risk})
+${dup.locations.map(l => `  - ${l.project}: \`${l.file}\``).join('\n')}`
+).join('\n\n')}
+` : ''}
+
+### Recommendations
+${dataFlow.recommendations.map(r => `- ${r}`).join('\n') || '_None_'}
+`;
+    }
+
     report += `
 ---
-_Generated by Task Automation Engine - Precise Mode_
+_Generated by Task Automation Engine - Deep Investigation Mode_
 `;
 
     return report;
@@ -762,13 +1052,34 @@ Generated by Task Automation Engine
   /**
    * Determine next steps based on decision
    */
-  private determineNextSteps(decision: AgentDecision, verification: TaskVerificationResult): string[] {
+  private determineNextSteps(
+    decision: AgentDecision,
+    verification: TaskVerificationResult,
+    investigation?: InvestigationResult,
+    dataFlow?: DataFlowTrace
+  ): string[] {
     const steps: string[] = [];
+    
+    // Add warning if duplicate logic found
+    if (dataFlow?.duplicateLogic && dataFlow.duplicateLogic.length > 0) {
+      steps.push('⚠️ IMPORTANT: Duplicate logic detected - check all locations before implementing');
+    }
+    
+    // Add warning if multi-project
+    if (dataFlow) {
+      const projects = new Set(dataFlow.dataPoints.map(dp => dp.location.project));
+      if (projects.size >= 2) {
+        steps.push(`⚠️ Changes may be needed in ${projects.size} projects: ${[...projects].join(', ')}`);
+      }
+    }
     
     switch (decision.action) {
       case 'implement':
         steps.push('Review the generated guidance document');
         steps.push('Identify all files that need modification');
+        if (investigation?.understanding.layer === 'multiple') {
+          steps.push('⚠️ This affects multiple layers - coordinate frontend and backend changes');
+        }
         steps.push('Implement changes following existing patterns');
         steps.push('Add comprehensive tests');
         steps.push('Run full test suite');
@@ -806,9 +1117,21 @@ Generated by Task Automation Engine
         
       case 'investigate':
         steps.push('Research the topic thoroughly');
+        if (investigation?.uncertainties && investigation.uncertainties.length > 0) {
+          steps.push(`Clarify uncertainties: ${investigation.uncertainties.slice(0, 3).join('; ')}`);
+        }
         steps.push('Document findings');
         steps.push('Create implementation plan');
         break;
+    }
+    
+    // Add investigation-specific next steps
+    if (investigation?.actions) {
+      for (const action of investigation.actions.slice(0, 3)) {
+        if (!steps.some(s => s.includes(action.description))) {
+          steps.push(`[${action.type.toUpperCase()}] ${action.description}`);
+        }
+      }
     }
     
     return steps;
