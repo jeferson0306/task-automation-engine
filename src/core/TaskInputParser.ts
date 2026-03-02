@@ -336,15 +336,50 @@ export class TaskInputParser {
 
   /**
    * Detect priority from text content
+   * Uses multiple heuristics to infer priority when not explicitly stated
    */
   private detectPriorityFromText(text: string): TaskPriority {
     const lower = text.toLowerCase();
-    
-    if (/\b(critical|blocker|urgent|asap|immediately|production down)\b/.test(lower)) return 'critical';
-    if (/\b(high priority|important|p1|major impact)\b/.test(lower)) return 'high';
-    if (/\b(medium|normal|standard)\b/.test(lower)) return 'medium';
-    if (/\b(low priority|minor|nice to have|when possible)\b/.test(lower)) return 'low';
-    
+
+    // Explicit priority keywords (highest confidence)
+    if (/\b(critical|blocker|urgent|asap|immediately|production.?down|p0|severity.?1|sev.?1)\b/.test(lower)) {
+      return 'critical';
+    }
+    if (/\b(high.?priority|important|p1|major.?impact|severity.?2|sev.?2|high)\b/.test(lower)) {
+      return 'high';
+    }
+    if (/\b(medium.?priority|normal|standard|p2|moderate|severity.?3|sev.?3)\b/.test(lower)) {
+      return 'medium';
+    }
+    if (/\b(low.?priority|minor|nice.?to.?have|when.?possible|p3|trivial|cosmetic|severity.?4|sev.?4)\b/.test(lower)) {
+      return 'low';
+    }
+
+    // Context-based inference (medium confidence)
+    // Bug fixes affecting core functionality are typically high priority
+    const isBugFix = /\b(bug|fix|defect|error|wrong|incorrect|broken)\b/.test(lower);
+    const affectsCore = /\b(calculation|payment|order|auth|login|security|data.?loss|crash)\b/.test(lower);
+    const affectsCustomer = /\b(customer|user|client|production|live)\b/.test(lower);
+    const isBlocking = /\b(block|prevent|cannot|unable|fail|exception)\b/.test(lower);
+
+    if (isBugFix) {
+      if (affectsCore && affectsCustomer) return 'critical';
+      if (affectsCore || isBlocking) return 'high';
+      return 'medium'; // Bug fixes default to medium, not unknown
+    }
+
+    // Feature/improvement inference
+    const isFeature = /\b(add|implement|create|new|feature|enhance)\b/.test(lower);
+    if (isFeature) {
+      if (affectsCustomer || /\b(required|must|need)\b/.test(lower)) return 'high';
+      return 'medium';
+    }
+
+    // Refactor/maintenance is typically lower priority
+    if (/\b(refactor|cleanup|technical.?debt|optimize|improve.?code)\b/.test(lower)) {
+      return 'low';
+    }
+
     return 'unknown';
   }
 

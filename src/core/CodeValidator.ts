@@ -295,9 +295,13 @@ export class CodeValidator {
     }
 
     const code = methodCode.code.toLowerCase();
+    const originalCode = methodCode.code; // Keep original case for snippets
+    const codeLines = originalCode.split('\n');
     const bugIndicatorsFound: string[] = [];
     const fixIndicatorsFound: string[] = [];
     const debugInfo: string[] = [];
+    const contextSnippets: string[] = []; // Store context around found patterns
+    let bugLineNumber: number | undefined;
 
     logger.info(`  Method code length: ${methodCode.code.length} chars, line ${methodCode.lineNumber}`);
 
@@ -311,6 +315,25 @@ export class CodeValidator {
         if (code.includes(variation)) {
           bugIndicatorsFound.push(indicator.pattern);
           debugInfo.push(`Found bug pattern "${indicator.pattern}" as "${variation}"`);
+          
+          // Find the exact line and capture context (3 lines before/after)
+          const lineIndex = this.findLineContaining(codeLines, variation);
+          if (lineIndex >= 0 && !bugLineNumber) {
+            bugLineNumber = (methodCode.lineNumber || 1) + lineIndex;
+            const contextStart = Math.max(0, lineIndex - 2);
+            const contextEnd = Math.min(codeLines.length, lineIndex + 3);
+            const contextLines = codeLines.slice(contextStart, contextEnd);
+            
+            // Format with line numbers and highlight the bug line
+            const formattedContext = contextLines.map((line, i) => {
+              const actualLineNum = (methodCode.lineNumber || 1) + contextStart + i;
+              const prefix = (contextStart + i === lineIndex) ? '>>> ' : '    ';
+              return `${prefix}${actualLineNum}: ${line}`;
+            }).join('\n');
+            
+            contextSnippets.push(formattedContext);
+          }
+          
           found = true;
           break;
         }
@@ -331,6 +354,23 @@ export class CodeValidator {
         if (code.includes(variation)) {
           fixIndicatorsFound.push(indicator.pattern);
           debugInfo.push(`Found fix pattern "${indicator.pattern}" as "${variation}"`);
+          
+          // Find the exact line and capture context
+          const lineIndex = this.findLineContaining(codeLines, variation);
+          if (lineIndex >= 0 && contextSnippets.length === 0) {
+            const contextStart = Math.max(0, lineIndex - 2);
+            const contextEnd = Math.min(codeLines.length, lineIndex + 3);
+            const contextLines = codeLines.slice(contextStart, contextEnd);
+            
+            const formattedContext = contextLines.map((line, i) => {
+              const actualLineNum = (methodCode.lineNumber || 1) + contextStart + i;
+              const prefix = (contextStart + i === lineIndex) ? '>>> ' : '    ';
+              return `${prefix}${actualLineNum}: ${line}`;
+            }).join('\n');
+            
+            contextSnippets.push(formattedContext);
+          }
+          
           found = true;
           break;
         }
@@ -383,17 +423,35 @@ export class CodeValidator {
       logger.info(`  ⚪ UNKNOWN: No patterns matched in method ${methodName}`);
     }
 
+    // Build context snippet - prefer the highlighted context, fallback to method code
+    const contextSnippet = contextSnippets.length > 0 
+      ? contextSnippets[0] 
+      : methodCode.code.substring(0, 500);
+
     return {
       status,
       confidence: Math.min(confidence, 100),
       evidence: {
         bugIndicatorsFound,
         fixIndicatorsFound,
-        codeSnippet: methodCode.code.substring(0, 500),
-        lineNumber: methodCode.lineNumber,
+        codeSnippet: contextSnippet,
+        lineNumber: bugLineNumber || methodCode.lineNumber,
       },
       explanation,
     };
+  }
+
+  /**
+   * Find the line index containing a pattern (case-insensitive)
+   */
+  private static findLineContaining(lines: string[], pattern: string): number {
+    const lowerPattern = pattern.toLowerCase();
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].toLowerCase().includes(lowerPattern)) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   /**
