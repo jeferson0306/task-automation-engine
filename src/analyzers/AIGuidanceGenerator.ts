@@ -97,6 +97,8 @@ export interface FileModification {
   reason: string;
   suggestedChanges: string[];
   relatedTo: string; // which requirement
+  priority: 'primary' | 'secondary' | 'optional';  // NEW: Priority for ordering
+  pseudoDiff?: string;  // NEW: Expected changes in diff format
 }
 
 export interface FileCreation {
@@ -104,6 +106,15 @@ export interface FileCreation {
   type: 'source' | 'test' | 'config';
   purpose: string;
   template?: string;
+  sourceRoot?: string;  // NEW: Detected source root for correct path
+}
+
+// NEW: Source root detection
+export interface SourceRoots {
+  mainSource: string;     // e.g., src/main/java, src, lib
+  testSource: string;     // e.g., src/test/java, test, tests
+  resourcesDir?: string;  // e.g., src/main/resources
+  detected: boolean;
 }
 
 export interface CodePattern {
@@ -135,6 +146,180 @@ export interface InstructionStep {
  * Generates comprehensive instructions for AI agents (Cursor, Claude, Copilot)
  */
 export class AIGuidanceGenerator {
+  
+  /**
+   * Detect source roots from project structure
+   * Handles Java/Maven/Gradle, Node.js, Python, Go, etc.
+   */
+  private detectSourceRoots(snapshot: ProjectSnapshot, workingDir: string): SourceRoots {
+    const roots: SourceRoots = {
+      mainSource: 'src',
+      testSource: 'test',
+      detected: false,
+    };
+
+    // Check for Maven/Gradle structure (Java/Kotlin)
+    const hasMavenStructure = snapshot.files.some(f => 
+      f.path.includes('src/main/java') || f.path.includes('src/main/kotlin')
+    );
+    const hasGradleStructure = snapshot.files.some(f => 
+      f.path.includes('src/main/java') || f.path.includes('src/main/kotlin')
+    );
+
+    if (hasMavenStructure || hasGradleStructure) {
+      // Detect language (Java or Kotlin)
+      const hasJava = snapshot.files.some(f => f.path.includes('src/main/java'));
+      const hasKotlin = snapshot.files.some(f => f.path.includes('src/main/kotlin'));
+      
+      roots.mainSource = hasKotlin ? 'src/main/kotlin' : 'src/main/java';
+      roots.testSource = hasKotlin ? 'src/test/kotlin' : 'src/test/java';
+      roots.resourcesDir = 'src/main/resources';
+      roots.detected = true;
+      logger.info(`  Detected Maven/Gradle structure: ${roots.mainSource}`);
+      return roots;
+    }
+
+    // Check for Node.js/TypeScript structure
+    const hasNodeStructure = snapshot.configFiles.some(c => 
+      c.path.includes('package.json') || c.path.includes('tsconfig.json')
+    );
+    if (hasNodeStructure) {
+      // Common patterns: src/, lib/, app/
+      if (snapshot.files.some(f => f.path.startsWith('src/'))) {
+        roots.mainSource = 'src';
+        roots.testSource = snapshot.files.some(f => f.path.includes('__tests__')) 
+          ? 'src/__tests__' 
+          : 'test';
+        roots.detected = true;
+        logger.info('  Detected Node.js/TypeScript structure');
+        return roots;
+      }
+    }
+
+    // Check for Python structure
+    const hasPythonStructure = snapshot.configFiles.some(c => 
+      c.path.includes('setup.py') || c.path.includes('pyproject.toml')
+    );
+    if (hasPythonStructure) {
+      roots.mainSource = 'src';
+      roots.testSource = 'tests';
+      roots.detected = true;
+      logger.info('  Detected Python structure');
+      return roots;
+    }
+
+    // Check for Go structure
+    const hasGoStructure = snapshot.files.some(f => f.path.endsWith('.go'));
+    if (hasGoStructure) {
+      roots.mainSource = '.';
+      roots.testSource = '.';  // Go tests are in same directory
+      roots.detected = true;
+      logger.info('  Detected Go structure');
+      return roots;
+    }
+
+    logger.info('  Using default source roots (src, test)');
+    return roots;
+  }
+
+  /**
+   * Generate correct test file path based on source roots
+   */
+  private generateTestFilePath(
+    mainFilePath: string, 
+    sourceRoots: SourceRoots,
+    language: string
+  ): string {
+    let testPath = mainFilePath;
+
+    // Replace main source root with test source root
+    if (mainFilePath.includes(sourceRoots.mainSource)) {
+      testPath = mainFilePath.replace(sourceRoots.mainSource, sourceRoots.testSource);
+    }
+
+    // Add test suffix based on language
+    const langLower = language.toLowerCase();
+    if (langLower === 'java' || langLower === 'kotlin') {
+      // Java/Kotlin: ClassName.java -> ClassNameTest.java
+      testPath = testPath.replace(/\.(java|kt)$/, 'Test.$1');
+    } else if (langLower === 'typescript' || langLower === 'javascript') {
+      // TypeScript/JS: file.ts -> file.test.ts or file.spec.ts
+      testPath = testPath.replace(/\.(ts|tsx|js|jsx)$/, '.test.$1');
+    } else if (langLower === 'python') {
+      // Python: module.py -> test_module.py
+      const dir = path.dirname(testPath);
+      const filename = path.basename(testPath);
+      testPath = path.join(dir, `test_${filename}`);
+    } else if (langLower === 'go') {
+      // Go: file.go -> file_test.go (same directory)
+      testPath = mainFilePath.replace('.go', '_test.go');
+    }
+
+    return testPath;
+  }
+
+  /**
+   * Generate pseudo-diff showing expected changes
+   */
+  private generatePseudoDiff(
+    taskDescription: string,
+    verification: TaskVerificationResult
+  ): string {
+    const lines: string[] = [];
+    
+    // Extract bug and fix patterns from verification evidence
+    const bugPatterns: string[] = [];
+    const fixPatterns: string[] = [];
+    
+    for (const ev of verification.evidence) {
+      if (ev.description.toLowerCase().includes('bug') || ev.description.toLowerCase().includes('wrong')) {
+        // Extract pattern from description
+        const match = ev.description.match(/uses?\s+(\w+)/i);
+        if (match) bugPatterns.push(match[1]);
+      }
+      if (ev.description.toLowerCase().includes('should use') || ev.description.toLowerCase().includes('fix')) {
+        const match = ev.description.match(/use\s+(\w+)/i);
+        if (match) fixPatterns.push(match[1]);
+      }
+    }
+
+    // Also extract from task description
+    const useInsteadMatch = taskDescription.match(/use\s+([a-zA-Z0-9_.]+)\s+instead\s+of\s+([a-zA-Z0-9_.]+)/i);
+    if (useInsteadMatch) {
+      fixPatterns.push(useInsteadMatch[1]);
+      bugPatterns.push(useInsteadMatch[2]);
+    }
+
+    if (bugPatterns.length > 0 || fixPatterns.length > 0) {
+      lines.push('```diff');
+      lines.push('# Expected changes (pseudo-diff):');
+      
+      for (const bug of [...new Set(bugPatterns)]) {
+        lines.push(`- // OLD: code using ${bug}`);
+      }
+      for (const fix of [...new Set(fixPatterns)]) {
+        lines.push(`+ // NEW: code using ${fix}`);
+      }
+      
+      // Add more specific example if we have both
+      if (bugPatterns.length > 0 && fixPatterns.length > 0) {
+        lines.push('');
+        lines.push('# Example transformation:');
+        lines.push(`- result = entity.get${this.capitalize(bugPatterns[0])}();`);
+        lines.push(`+ result = entity.get${this.capitalize(fixPatterns[0])}();`);
+      }
+      
+      lines.push('```');
+    }
+
+    return lines.join('\n');
+  }
+
+  private capitalize(str: string): string {
+    if (!str) return str;
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  }
+
   /**
    * Generate complete instruction set for AI agents
    */
@@ -147,6 +332,10 @@ export class AIGuidanceGenerator {
 
     const snapshot = context.projectSnapshot!;
     const task = context.task;
+    
+    // Detect source roots for correct file paths
+    const sourceRoots = this.detectSourceRoots(snapshot, context.workingDir);
+    logger.info(`  Source roots: main=${sourceRoots.mainSource}, test=${sourceRoots.testSource}`);
 
     // Analyze project conventions (LEARN from the codebase)
     const conventions = await ProjectConventionsAnalyzer.analyze(
@@ -158,17 +347,20 @@ export class AIGuidanceGenerator {
       }
     );
 
+    // Get project context for language detection
+    const projectContext = this.generateProjectContext(context, snapshot);
+    
     const instructionSet: AIInstructionSet = {
       taskId: task.taskId,
       taskTitle: task.title,
       generatedAt: new Date().toISOString(),
 
       summary: this.generateSummary(verification, taskDescription),
-      projectContext: this.generateProjectContext(context, snapshot),
+      projectContext,
       conventions: this.formatConventions(conventions),
       requirements: this.generateRequirements(task, taskDescription, verification),
-      implementation: this.generateImplementationGuidance(context, verification, taskDescription),
-      testing: this.generateTestingGuidance(context, verification, taskDescription),
+      implementation: this.generateImplementationGuidance(context, verification, taskDescription, sourceRoots, projectContext.language),
+      testing: this.generateTestingGuidance(context, verification, taskDescription, sourceRoots, projectContext.language),
       validation: this.generateValidationSteps(context, snapshot),
       steps: this.generateStepByStep(verification, context, taskDescription),
       warnings: this.generateWarnings(verification, context),
@@ -291,27 +483,56 @@ export class AIGuidanceGenerator {
     }
 
     // Implementation
-    md += `## Implementation\n`;
+    md += `## Implementation\n\n`;
+    
+    // CRITICAL: Add explicit instruction about order
+    md += `> ⚠️ **IMPORTANT**: Modify the main source code FIRST, then create/update tests.\n`;
+    md += `> Do NOT create test files before fixing the actual bug in the source code.\n\n`;
     
     if (instructionSet.implementation.filesToModify.length > 0) {
-      md += `### Files to Modify\n`;
-      for (const file of instructionSet.implementation.filesToModify) {
-        md += `#### ${file.path}\n`;
-        md += `- **Reason:** ${file.reason}\n`;
-        if (file.suggestedChanges.length > 0) {
-          md += `- **Changes:**\n`;
-          for (const change of file.suggestedChanges) {
-            md += `  - ${change}\n`;
+      // Separate primary and secondary files
+      const primaryFiles = instructionSet.implementation.filesToModify.filter(f => f.priority === 'primary');
+      const secondaryFiles = instructionSet.implementation.filesToModify.filter(f => f.priority !== 'primary');
+      
+      if (primaryFiles.length > 0) {
+        md += `### 🎯 Primary Files to Modify (FIX THESE FIRST)\n\n`;
+        for (const file of primaryFiles) {
+          md += `#### ${file.path}\n`;
+          md += `- **Priority:** PRIMARY - This is where the bug exists\n`;
+          md += `- **Reason:** ${file.reason}\n`;
+          if (file.suggestedChanges.length > 0) {
+            md += `- **Changes:**\n`;
+            for (const change of file.suggestedChanges) {
+              md += `  - ${change}\n`;
+            }
           }
+          // Add pseudo-diff if available
+          if (file.pseudoDiff) {
+            md += `\n**Expected Changes:**\n${file.pseudoDiff}\n`;
+          }
+          md += '\n';
+        }
+      }
+      
+      if (secondaryFiles.length > 0) {
+        md += `### Secondary Files (Review if needed)\n`;
+        for (const file of secondaryFiles) {
+          md += `- **${file.path}** - ${file.reason}\n`;
         }
         md += '\n';
       }
     }
 
     if (instructionSet.implementation.filesToCreate.length > 0) {
-      md += `### Files to Create\n`;
+      md += `### Files to Create (AFTER fixing the code)\n\n`;
+      md += `> Create these files only AFTER the main fix is complete and verified.\n\n`;
       for (const file of instructionSet.implementation.filesToCreate) {
-        md += `- **${file.suggestedPath}** (${file.type}): ${file.purpose}\n`;
+        md += `- **${file.suggestedPath}**\n`;
+        md += `  - Type: ${file.type}\n`;
+        md += `  - Purpose: ${file.purpose}\n`;
+        if (file.sourceRoot) {
+          md += `  - Source Root: \`${file.sourceRoot}\`\n`;
+        }
       }
       md += '\n';
     }
@@ -493,40 +714,75 @@ export class AIGuidanceGenerator {
   private generateImplementationGuidance(
     context: ExecutionContext,
     verification: TaskVerificationResult,
-    taskDescription: string
+    taskDescription: string,
+    sourceRoots: SourceRoots,
+    language: string
   ): AIInstructionSet['implementation'] {
     const filesToModify: FileModification[] = [];
     const filesToCreate: FileCreation[] = [];
     const codePatterns: CodePattern[] = [];
     const avoidPatterns: string[] = [];
+    const seenPaths = new Set<string>();
 
-    // Files from evidence
+    // Generate pseudo-diff for expected changes
+    const pseudoDiff = this.generatePseudoDiff(taskDescription, verification);
+
+    // PRIORITY: Process main source files FIRST (not tests)
+    // This ensures the AI modifies the actual code before creating tests
     for (const file of verification.relatedFiles) {
-      if (!file.includes('test') && !file.includes('Test')) {
+      const isTestFile = file.toLowerCase().includes('test') || 
+                         file.includes('__tests__') ||
+                         file.includes('_test.') ||
+                         file.includes('.test.') ||
+                         file.includes('.spec.');
+      
+      if (!isTestFile) {
+        // Normalize path to avoid duplicates (absolute vs relative)
+        const normalizedPath = file.includes(sourceRoots.mainSource)
+          ? file.substring(file.indexOf(sourceRoots.mainSource))
+          : file;
+        
+        if (seenPaths.has(normalizedPath) || seenPaths.has(path.basename(file))) {
+          continue; // Skip duplicate paths
+        }
+        seenPaths.add(normalizedPath);
+        seenPaths.add(path.basename(file));
+        
         const evidence = verification.evidence.filter(e => e.file === file);
+        const hasBugEvidence = evidence.some(e => 
+          e.description.toLowerCase().includes('bug') || 
+          e.type === 'code_validation'
+        );
+        
         filesToModify.push({
-          path: file,
+          path: normalizedPath,
           reason: evidence.length > 0 ? evidence[0].description : 'Related to task',
-          suggestedChanges: evidence.map(e => e.snippet).slice(0, 3),
+          suggestedChanges: evidence.map(e => e.snippet).filter(s => s).slice(0, 3),
           relatedTo: 'Main implementation',
+          priority: hasBugEvidence ? 'primary' : 'secondary',
+          pseudoDiff: hasBugEvidence ? pseudoDiff : undefined,
         });
       }
     }
 
-    // Suggest test file if needed
-    if (!verification.testCoverage.hasTests) {
-      const mainFile = filesToModify[0];
+    // Sort by priority: primary files first
+    filesToModify.sort((a, b) => {
+      if (a.priority === 'primary' && b.priority !== 'primary') return -1;
+      if (b.priority === 'primary' && a.priority !== 'primary') return 1;
+      return 0;
+    });
+
+    // Generate test file path correctly using source roots
+    if (!verification.testCoverage.hasTests || verification.testCoverage.coverageStatus === 'uncovered') {
+      const mainFile = filesToModify.find(f => f.priority === 'primary') || filesToModify[0];
       if (mainFile) {
-        const testPath = mainFile.path
-          .replace('/main/', '/test/')
-          .replace('.java', 'Test.java')
-          .replace('.ts', '.test.ts')
-          .replace('.py', '_test.py');
+        const testPath = this.generateTestFilePath(mainFile.path, sourceRoots, language);
         
         filesToCreate.push({
           suggestedPath: testPath,
           type: 'test',
           purpose: 'Test coverage for the implementation',
+          sourceRoot: sourceRoots.testSource,
         });
       }
     }
@@ -535,6 +791,14 @@ export class AIGuidanceGenerator {
     if (context.contractContext) {
       avoidPatterns.push('Avoid hardcoded values - use constants');
       avoidPatterns.push('Avoid null without proper handling');
+    }
+    
+    // Add task-specific patterns to avoid
+    if (taskDescription.toLowerCase().includes('instead of')) {
+      const match = taskDescription.match(/instead\s+of\s+([a-zA-Z0-9_.]+)/i);
+      if (match) {
+        avoidPatterns.push(`Do NOT use ${match[1]} (this is the bug we're fixing)`);
+      }
     }
 
     return {
@@ -548,7 +812,9 @@ export class AIGuidanceGenerator {
   private generateTestingGuidance(
     context: ExecutionContext,
     verification: TaskVerificationResult,
-    taskDescription: string
+    taskDescription: string,
+    sourceRoots: SourceRoots,
+    language: string
   ): AIInstructionSet['testing'] {
     const testCases: TestCase[] = [];
 
@@ -649,37 +915,61 @@ export class AIGuidanceGenerator {
     let order = 1;
 
     const action = verification.aiGuidance.action;
+    
+    // Separate main source files from test files
+    const mainFiles = verification.aiGuidance.filesToModify.filter(f => 
+      !f.toLowerCase().includes('test') && !f.includes('_test.') && !f.includes('.test.')
+    );
+    const testFiles = verification.aiGuidance.filesToCreate.filter(f => 
+      f.toLowerCase().includes('test') || f.includes('_test.') || f.includes('.test.')
+    );
 
     if (action === 'implement') {
       steps.push({
         order: order++,
         action: 'Understand Requirements',
-        description: 'Read and understand the task description and acceptance criteria',
-        verification: 'Can explain the task in your own words',
+        description: 'Read and understand the task description and acceptance criteria. Identify what the bug is and what the fix should be.',
+        verification: 'Can explain the bug and required fix in your own words',
       });
 
       steps.push({
         order: order++,
-        action: 'Identify Files',
-        description: 'Locate the files that need to be modified',
-        files: verification.relatedFiles,
-        verification: 'All relevant files identified',
+        action: 'Locate Primary Source File',
+        description: 'Open the PRIMARY source file that contains the bug. Do NOT open test files yet.',
+        files: mainFiles.length > 0 ? mainFiles : verification.aiGuidance.filesToModify,
+        verification: 'Primary source file is open and bug location is identified',
       });
 
       steps.push({
         order: order++,
-        action: 'Implement Changes',
-        description: 'Make the required code changes',
-        files: verification.aiGuidance.filesToModify,
-        verification: 'Code compiles without errors',
+        action: '🎯 FIX THE BUG (Critical Step)',
+        description: 'Make the required code changes IN THE SOURCE FILE. This is the main implementation step. Apply the fix as described in the pseudo-diff. Do NOT create or modify test files at this step.',
+        files: mainFiles.length > 0 ? mainFiles : verification.aiGuidance.filesToModify,
+        verification: 'Bug is fixed. Code compiles without errors.',
       });
 
       steps.push({
         order: order++,
-        action: 'Add Tests',
-        description: 'Create or update tests for the changes',
-        files: verification.aiGuidance.filesToCreate,
-        verification: 'All tests pass',
+        action: 'Verify Compilation',
+        description: 'Run the build command to verify the fix compiles correctly.',
+        commands: ['mvn compile', '# or: ./gradlew compileJava', '# or: npm run build'],
+        verification: 'Build succeeds with no errors',
+      });
+
+      steps.push({
+        order: order++,
+        action: 'Create/Update Tests (After Fix)',
+        description: 'NOW create or update test files to cover the fix. Tests should verify both the old buggy behavior is gone and the new correct behavior works.',
+        files: testFiles.length > 0 ? testFiles : verification.aiGuidance.filesToCreate,
+        verification: 'Test file is created in the correct source root (e.g., src/test/java)',
+      });
+
+      steps.push({
+        order: order++,
+        action: 'Run Tests',
+        description: 'Execute tests to verify the fix works correctly.',
+        commands: ['mvn test', '# or: ./gradlew test', '# or: npm test'],
+        verification: 'All tests pass, including the new ones',
       });
 
     } else if (action === 'review') {
