@@ -126,6 +126,9 @@ export class CodeValidator {
    * - DECLARATIVE: "uses X instead of Y" = X is WRONG, Y is correct
    * - IMPERATIVE: "use X instead of Y" = X is CORRECT, Y is wrong
    * - DIRECTIVE: "should use X", "must use X" = X is CORRECT
+   * 
+   * IMPORTANT: Method names mentioned in the task (like "In ClassName.methodName()")
+   * are NOT bug indicators - they're just identifying WHERE the bug is.
    */
   static extractIndicators(taskDescription: string): {
     bugIndicators: BugIndicator[];
@@ -136,12 +139,32 @@ export class CodeValidator {
     const seenBugPatterns = new Set<string>();
     const seenFixPatterns = new Set<string>();
     
+    // Extract method names mentioned in the task - these should NOT be bug indicators
+    // Pattern: "In ClassName.methodName()" or "ClassName.methodName()"
+    const ignoredPatterns = new Set<string>();
+    const methodMentionPattern = /(?:in\s+)?([A-Z][a-zA-Z0-9]*)\s*\.\s*([a-z][a-zA-Z0-9]*)\s*\(\)/gi;
+    let methodMatch;
+    while ((methodMatch = methodMentionPattern.exec(taskDescription)) !== null) {
+      // Add both the method name and the full Class.method pattern to ignored list
+      ignoredPatterns.add(methodMatch[2].toLowerCase()); // methodName
+      ignoredPatterns.add(`${methodMatch[1]}.${methodMatch[2]}`.toLowerCase()); // Class.method
+    }
+    
+    // Also ignore common task description words that aren't code
+    const commonWords = ['fix', 'bug', 'wrong', 'calculation', 'date', 'order', 'master', 
+                         'published', 'estimated', 'delivery', 'weeks', 'days', 'working',
+                         'return', 'past', 'dates', 'tests', 'scenarios', 'add'];
+    commonWords.forEach(w => ignoredPatterns.add(w));
+    
+    logger.debug(`  Ignored patterns (method names): ${Array.from(ignoredPatterns).join(', ')}`);
+    
     let match;
 
-    // Helper to add bug indicator with deduplication
+    // Helper to add bug indicator with deduplication and filtering
     const addBugIndicator = (pattern: string, description: string) => {
       const clean = this.cleanValue(pattern);
-      if (clean.length > 2 && !seenBugPatterns.has(clean)) {
+      // Skip if it's a method name or common word
+      if (clean.length > 2 && !seenBugPatterns.has(clean) && !ignoredPatterns.has(clean)) {
         seenBugPatterns.add(clean);
         bugIndicators.push({
           type: 'uses_wrong',
@@ -151,10 +174,11 @@ export class CodeValidator {
       }
     };
 
-    // Helper to add fix indicator with deduplication
+    // Helper to add fix indicator with deduplication and filtering
     const addFixIndicator = (pattern: string, description: string) => {
       const clean = this.cleanValue(pattern);
-      if (clean.length > 2 && !seenFixPatterns.has(clean)) {
+      // Skip if it's a method name or common word (but keep property names like createdAt)
+      if (clean.length > 2 && !seenFixPatterns.has(clean) && !ignoredPatterns.has(clean)) {
         seenFixPatterns.add(clean);
         fixIndicators.push({
           type: 'should_use',
@@ -294,16 +318,21 @@ export class CodeValidator {
       };
     }
 
-    const code = methodCode.code.toLowerCase();
-    const originalCode = methodCode.code; // Keep original case for snippets
+    const originalCode = methodCode.code; // Keep original for snippets
     const codeLines = originalCode.split('\n');
+    
+    // Strip comments before validation to avoid false positives from commented code
+    // Comments often contain the "wrong" value for documentation purposes
+    const codeWithoutComments = this.stripComments(methodCode.code);
+    const code = codeWithoutComments.toLowerCase();
+    
     const bugIndicatorsFound: string[] = [];
     const fixIndicatorsFound: string[] = [];
     const debugInfo: string[] = [];
     const contextSnippets: string[] = []; // Store context around found patterns
     let bugLineNumber: number | undefined;
 
-    logger.info(`  Method code length: ${methodCode.code.length} chars, line ${methodCode.lineNumber}`);
+    logger.info(`  Method code length: ${methodCode.code.length} chars (${codeWithoutComments.length} without comments), line ${methodCode.lineNumber}`);
 
     // Check for bug indicators with all pattern variations
     for (const indicator of bugIndicators) {
@@ -452,6 +481,29 @@ export class CodeValidator {
       }
     }
     return -1;
+  }
+
+  /**
+   * Strip comments from code to avoid false positives
+   * Comments often contain the "wrong" value for documentation purposes
+   * e.g., "// TASK-123: use newValue instead of oldValue"
+   */
+  private static stripComments(code: string): string {
+    // Remove single-line comments: // ... or # ...
+    let result = code.replace(/\/\/.*$/gm, '');
+    result = result.replace(/#.*$/gm, '');
+    
+    // Remove multi-line comments: /* ... */
+    result = result.replace(/\/\*[\s\S]*?\*\//g, '');
+    
+    // Remove XML/HTML comments: <!-- ... -->
+    result = result.replace(/<!--[\s\S]*?-->/g, '');
+    
+    // Remove Python docstrings: """ ... """ or ''' ... '''
+    result = result.replace(/"""[\s\S]*?"""/g, '');
+    result = result.replace(/'''[\s\S]*?'''/g, '');
+    
+    return result;
   }
 
   /**

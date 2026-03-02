@@ -222,23 +222,9 @@ export class TaskVerifier {
       let description: string;
       let confidence: number;
 
-      switch (validation.status) {
-        case 'bug_exists':
-          description = `🔴 BUG EXISTS: ${validation.explanation}`;
-          confidence = validation.confidence;
-          break;
-        case 'fix_applied':
-          description = `🟢 FIX APPLIED: ${validation.explanation}`;
-          confidence = validation.confidence;
-          break;
-        case 'partial_fix':
-          description = `🟡 PARTIAL FIX: ${validation.explanation}`;
-          confidence = validation.confidence;
-          break;
-        default:
-          description = `⚪ UNKNOWN: ${validation.explanation}`;
-          confidence = validation.confidence;
-      }
+      // Use validation explanation directly (already includes status prefix)
+      description = validation.explanation;
+      confidence = validation.confidence;
 
       evidence.push({
         type: 'code_validation',
