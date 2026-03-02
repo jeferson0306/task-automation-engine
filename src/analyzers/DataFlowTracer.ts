@@ -116,8 +116,12 @@ export class DataFlowTracer {
     // Detect flow paths (how data moves through the system)
     const flowPaths = this.detectFlowPaths(dataPoints, workspace);
     
-    // Detect duplicate logic
-    const duplicateLogic = this.detectDuplicateLogic(dataPoints);
+    // Detect duplicate logic (from dataPoints)
+    let duplicateLogic = this.detectDuplicateLogic(dataPoints);
+    
+    // GAP 3 FIX: Also search for duplicate functions across projects by name
+    const crossProjectDuplicates = await this.findCrossProjectDuplicateFunctions(workspace);
+    duplicateLogic = [...duplicateLogic, ...crossProjectDuplicates];
     
     // Generate recommendations
     const recommendations = this.generateRecommendations(dataPoints, flowPaths, duplicateLogic, context);
@@ -534,6 +538,169 @@ export class DataFlowTracer {
     }
     
     return duplicates;
+  }
+  
+  /**
+   * GAP 3: Search for duplicate functions across projects by name
+   * Specifically targets common business logic functions like addWorkingDays, calculateDate, etc.
+   */
+  private async findCrossProjectDuplicateFunctions(workspace: Workspace): Promise<DuplicateLogic[]> {
+    const duplicates: DuplicateLogic[] = [];
+    
+    // Function patterns that indicate business logic we should check for duplicates
+    const businessLogicPatterns = [
+      /addWorkingDays/i,
+      /addDays/i,
+      /addWeeks/i,
+      /calculateDate/i,
+      /computeDate/i,
+      /getEstimatedDate/i,
+      /getDueDate/i,
+      /get\w+DueDate/i,         // Pattern: getFooDueDate, getItemDueDate, etc.
+      /formatDate/i,
+      /parseDate/i,
+      /businessDays/i,
+      /workingDays/i,
+    ];
+    
+    // Map of function name -> locations where found
+    const functionLocations = new Map<string, Array<{project: string; file: string; line?: number; layer: DataLocation['layer']}>>();
+    
+    for (const project of workspace.projects) {
+      try {
+        const files = await this.getSourceFiles(project.path);
+        
+        for (const file of files) {
+          const content = await this.readFileContent(file);
+          if (!content) continue;
+          
+          const lines = content.split('\n');
+          
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            
+            for (const pattern of businessLogicPatterns) {
+              const match = pattern.exec(line);
+              if (match) {
+                const funcName = match[0].toLowerCase();
+                
+                if (!functionLocations.has(funcName)) {
+                  functionLocations.set(funcName, []);
+                }
+                
+                // Determine layer
+                const layer = this.inferLayer(file, line, project);
+                
+                // Check if we already have this file for this function
+                const existingLocations = functionLocations.get(funcName)!;
+                if (!existingLocations.some(l => l.file === file)) {
+                  existingLocations.push({
+                    project: project.name,
+                    file,
+                    line: i + 1,
+                    layer,
+                  });
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // Skip projects with read errors
+      }
+    }
+    
+    // Find functions that appear in multiple projects
+    for (const [funcName, locations] of functionLocations) {
+      // Group by project
+      const byProject = new Map<string, typeof locations[0]>();
+      for (const loc of locations) {
+        if (!byProject.has(loc.project)) {
+          byProject.set(loc.project, loc);
+        }
+      }
+      
+      if (byProject.size >= 2) {
+        const uniqueLocs = Array.from(byProject.values());
+        const layers = new Set(uniqueLocs.map(l => l.layer));
+        const inDifferentLayers = layers.size >= 2;
+        
+        duplicates.push({
+          description: inDifferentLayers
+            ? `🔴 CRITICAL DUPLICATE: Function "${funcName}" found in BOTH frontend AND backend projects! This likely causes inconsistent calculations.`
+            : `⚠️ DUPLICATE: Function "${funcName}" found in ${byProject.size} different projects: ${[...byProject.keys()].join(', ')}`,
+          locations: uniqueLocs.map(l => ({
+            project: l.project,
+            file: l.file,
+            line: l.line,
+            layer: l.layer,
+          })),
+          similarity: inDifferentLayers ? 95 : 80,
+          risk: inDifferentLayers ? 'high' : 'medium',
+        });
+      }
+    }
+    
+    return duplicates;
+  }
+  
+  /**
+   * Get all source files from a project
+   */
+  private async getSourceFiles(projectPath: string): Promise<string[]> {
+    const results: string[] = [];
+    
+    async function walk(dir: string, depth = 0): Promise<void> {
+      if (depth > 6) return;
+      
+      try {
+        const { readdir, stat } = await import('fs/promises');
+        const path = await import('path');
+        
+        const entries = await readdir(dir);
+        for (const entry of entries) {
+          // Skip common non-source directories
+          if (entry.startsWith('.') || 
+              entry === 'node_modules' || 
+              entry === 'dist' || 
+              entry === 'build' ||
+              entry === 'target' ||
+              entry === '.git') {
+            continue;
+          }
+          
+          const fullPath = path.join(dir, entry);
+          const stats = await stat(fullPath);
+          
+          if (stats.isDirectory()) {
+            await walk(fullPath, depth + 1);
+          } else if (stats.isFile()) {
+            const ext = path.extname(entry).toLowerCase();
+            // Include both frontend and backend source files
+            if (['.ts', '.tsx', '.js', '.jsx', '.vue', '.java', '.kt', '.py', '.go'].includes(ext)) {
+              results.push(fullPath);
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore permission errors
+      }
+    }
+    
+    await walk(projectPath);
+    return results;
+  }
+  
+  /**
+   * Read file content safely
+   */
+  private async readFileContent(filePath: string): Promise<string | null> {
+    try {
+      const { readFile } = await import('fs/promises');
+      return await readFile(filePath, 'utf-8');
+    } catch {
+      return null;
+    }
   }
   
   /**

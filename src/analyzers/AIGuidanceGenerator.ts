@@ -1077,6 +1077,323 @@ export class AIGuidanceGenerator {
 
     return notes;
   }
+
+  /**
+   * Generate actionable Implementation Guide markdown
+   * This is the file that tells the AI EXACTLY what to do
+   */
+  static generateImplementationGuide(
+    taskId: string,
+    taskDescription: string,
+    verification: TaskVerificationResult,
+    investigation?: {
+      understanding: {
+        layer: string;
+        type: string;
+        concepts: Array<{ name: string; type: string; importance: string; searchTerms: string[] }>;
+        expectedBehavior?: string;
+        actualBehavior?: string;
+      };
+      findings: Array<{ file: string; line?: number; type: string; description: string; code?: string }>;
+      actions: Array<{ priority: number; type: string; description: string; files: string[]; reason: string }>;
+    },
+    workspace?: {
+      projects: Array<{ name: string; path: string; type: string; language?: string }>;
+    }
+  ): string {
+    const lines: string[] = [];
+    
+    lines.push(`# Implementation Guide: ${taskId}`);
+    lines.push('');
+    lines.push(`> Generated: ${new Date().toISOString()}`);
+    lines.push('> This file contains actionable instructions for implementing the fix.');
+    lines.push('');
+    
+    // Critical alerts section
+    const isFrontendTask = investigation?.understanding.layer === 'frontend';
+    const isBackendProject = verification.relatedFiles.some(f => 
+      f.endsWith('.java') || f.endsWith('.kt') || f.endsWith('.go')
+    );
+    
+    if (isFrontendTask && isBackendProject) {
+      lines.push('## 🚨 CRITICAL: WRONG PROJECT');
+      lines.push('');
+      lines.push('**This task is a FRONTEND bug but you are in a BACKEND project!**');
+      lines.push('');
+      if (workspace) {
+        const frontendProjects = workspace.projects.filter(p => 
+          p.type === 'frontend' || p.name.includes('ui') || p.name.includes('web')
+        );
+        if (frontendProjects.length > 0) {
+          lines.push('**Switch to one of these frontend projects:**');
+          frontendProjects.forEach(p => {
+            lines.push(`- \`${p.path}\` (${p.name})`);
+          });
+        }
+      }
+      lines.push('');
+      lines.push('---');
+      lines.push('');
+    }
+    
+    // Task Understanding
+    lines.push('## Task Understanding');
+    lines.push('');
+    lines.push(`**Type:** ${investigation?.understanding.type || verification.aiGuidance.action}`);
+    lines.push(`**Layer:** ${investigation?.understanding.layer || 'unknown'}`);
+    lines.push(`**Confidence:** ${verification.confidence}%`);
+    lines.push('');
+    
+    // Expected vs Actual behavior
+    if (investigation?.understanding.expectedBehavior || investigation?.understanding.actualBehavior) {
+      lines.push('### Current Behavior (BUG)');
+      lines.push('```');
+      lines.push(investigation?.understanding.actualBehavior || 'Not detected');
+      lines.push('```');
+      lines.push('');
+      lines.push('### Expected Behavior (FIX)');
+      lines.push('```');
+      lines.push(investigation?.understanding.expectedBehavior || 'Not detected');
+      lines.push('```');
+      lines.push('');
+    }
+    
+    // Key concepts extracted
+    if (investigation?.understanding.concepts && investigation.understanding.concepts.length > 0) {
+      lines.push('### Key Concepts Extracted');
+      lines.push('');
+      const criticalConcepts = investigation.understanding.concepts.filter(c => c.importance === 'critical');
+      const importantConcepts = investigation.understanding.concepts.filter(c => c.importance === 'important');
+      
+      if (criticalConcepts.length > 0) {
+        lines.push('**Critical (must be addressed):**');
+        criticalConcepts.forEach(c => {
+          lines.push(`- \`${c.name}\` (${c.type}) → search for: ${c.searchTerms.slice(0, 3).join(', ')}`);
+        });
+        lines.push('');
+      }
+      if (importantConcepts.length > 0) {
+        lines.push('**Important:**');
+        importantConcepts.forEach(c => {
+          lines.push(`- \`${c.name}\` (${c.type})`);
+        });
+        lines.push('');
+      }
+    }
+    
+    lines.push('---');
+    lines.push('');
+    
+    // Primary file to modify
+    lines.push('## 📁 File to Modify');
+    lines.push('');
+    
+    // Determine primary file
+    let primaryFile = '';
+    let primaryReason = '';
+    
+    // If frontend task, prioritize frontend findings
+    if (isFrontendTask && investigation?.findings) {
+      const frontendFindings = investigation.findings.filter(f => 
+        f.file.endsWith('.ts') || f.file.endsWith('.tsx') || 
+        f.file.endsWith('.js') || f.file.endsWith('.vue') ||
+        f.file.includes('/ui/') || f.file.includes('-ui/')
+      );
+      if (frontendFindings.length > 0) {
+        // Prioritize util files for calculation bugs
+        const utilFile = frontendFindings.find(f => 
+          f.file.includes('util') || f.file.includes('helper') || f.file.includes('service')
+        );
+        if (utilFile) {
+          primaryFile = utilFile.file;
+          primaryReason = utilFile.description;
+        } else {
+          primaryFile = frontendFindings[0].file;
+          primaryReason = frontendFindings[0].description;
+        }
+      }
+    }
+    
+    // Fallback to verification files
+    if (!primaryFile && verification.relatedFiles.length > 0) {
+      // Filter by layer if known
+      if (isFrontendTask) {
+        const frontendFiles = verification.relatedFiles.filter(f => 
+          f.endsWith('.ts') || f.endsWith('.tsx') || f.endsWith('.vue')
+        );
+        primaryFile = frontendFiles[0] || verification.relatedFiles[0];
+      } else {
+        primaryFile = verification.relatedFiles[0];
+      }
+      primaryReason = 'Matched from task description';
+    }
+    
+    if (primaryFile) {
+      lines.push('```');
+      lines.push(primaryFile);
+      lines.push('```');
+      lines.push('');
+      lines.push(`**Reason:** ${primaryReason}`);
+    } else {
+      lines.push('⚠️ **No specific file identified.** Manual search required.');
+      lines.push('');
+      lines.push('**Search suggestions:**');
+      if (isFrontendTask) {
+        lines.push('- Look for `*.util.ts`, `*.utils.ts`, `*.helper.ts` files');
+        lines.push('- Search for functions containing "date", "calculate", "estimate"');
+      }
+    }
+    lines.push('');
+    
+    // Function/Method to modify
+    lines.push('## 🔧 Function/Method to Modify');
+    lines.push('');
+    
+    const methodConcepts = investigation?.understanding.concepts?.filter(c => 
+      c.type === 'calculation' || c.name.includes('get') || c.name.includes('calculate')
+    ) || [];
+    
+    if (methodConcepts.length > 0) {
+      lines.push('**Target functions (search for these):**');
+      methodConcepts.forEach(c => {
+        lines.push(`- \`${c.name}\``);
+      });
+    } else if (verification.codeReferences?.methods?.length > 0) {
+      lines.push('**Methods referenced:**');
+      verification.codeReferences.methods.forEach(m => {
+        lines.push(`- \`${m}\``);
+      });
+    } else {
+      lines.push('⚠️ **No specific method identified.**');
+      lines.push('');
+      lines.push('**Search for functions that:**');
+      lines.push('- Calculate dates (e.g., `getDueDate`, `calculateEstimatedDate`)');
+      lines.push('- Use `addDays`, `addWeeks`, `addWorkingDays`');
+      lines.push('- Check status conditions before date calculation');
+    }
+    lines.push('');
+    
+    // Code findings
+    if (investigation?.findings && investigation.findings.length > 0) {
+      lines.push('---');
+      lines.push('');
+      lines.push('## 🔍 Code Findings');
+      lines.push('');
+      
+      // Group by type
+      const potentialBugs = investigation.findings.filter(f => f.type === 'potential-bug');
+      const relevantCode = investigation.findings.filter(f => f.type === 'related-code' || f.type === 'transformation');
+      
+      if (potentialBugs.length > 0) {
+        lines.push('### ⚠️ Potential Bug Locations');
+        potentialBugs.slice(0, 5).forEach(f => {
+          lines.push(`- \`${f.file}\`${f.line ? `:${f.line}` : ''}`);
+          lines.push(`  - ${f.description}`);
+          if (f.code) {
+            lines.push('  ```');
+            lines.push(`  ${f.code}`);
+            lines.push('  ```');
+          }
+        });
+        lines.push('');
+      }
+      
+      if (relevantCode.length > 0) {
+        lines.push('### Related Code');
+        relevantCode.slice(0, 5).forEach(f => {
+          lines.push(`- \`${f.file}\`${f.line ? `:${f.line}` : ''} - ${f.description}`);
+        });
+        lines.push('');
+      }
+    }
+    
+    // Recommended actions
+    if (investigation?.actions && investigation.actions.length > 0) {
+      lines.push('---');
+      lines.push('');
+      lines.push('## ✅ Recommended Actions');
+      lines.push('');
+      
+      investigation.actions.forEach((action, idx) => {
+        lines.push(`### ${idx + 1}. [${action.type.toUpperCase()}] ${action.description}`);
+        if (action.files.length > 0) {
+          lines.push('**Files:**');
+          action.files.slice(0, 3).forEach(f => lines.push(`- \`${f}\``));
+        }
+        lines.push(`**Reason:** ${action.reason}`);
+        lines.push('');
+      });
+    }
+    
+    // Step-by-step implementation
+    lines.push('---');
+    lines.push('');
+    lines.push('## 📋 Step-by-Step Implementation');
+    lines.push('');
+    
+    let stepNum = 1;
+    
+    // Step 1: Open file
+    lines.push(`### Step ${stepNum++}: Open the file`);
+    if (primaryFile) {
+      lines.push(`Open \`${primaryFile}\``);
+    } else {
+      lines.push('Search for the file containing the buggy calculation.');
+    }
+    lines.push('');
+    
+    // Step 2: Locate function
+    lines.push(`### Step ${stepNum++}: Locate the function`);
+    if (methodConcepts.length > 0) {
+      lines.push(`Search for: \`${methodConcepts.map(c => c.name).join('` or `')}\``);
+    } else {
+      lines.push('Look for date calculation logic, especially functions with "date", "due", "estimated" in name.');
+    }
+    lines.push('');
+    
+    // Step 3: Understand the bug
+    lines.push(`### Step ${stepNum++}: Understand the current bug`);
+    if (investigation?.understanding.actualBehavior) {
+      lines.push(`Current behavior: ${investigation.understanding.actualBehavior}`);
+    } else {
+      lines.push('Read the function and understand what it currently does.');
+    }
+    lines.push('');
+    
+    // Step 4: Apply fix
+    lines.push(`### Step ${stepNum++}: Apply the fix`);
+    if (investigation?.understanding.expectedBehavior) {
+      lines.push(`Expected behavior: ${investigation.understanding.expectedBehavior}`);
+    } else {
+      lines.push('Modify the code according to the task requirements.');
+    }
+    lines.push('');
+    
+    // Step 5: Add tests
+    lines.push(`### Step ${stepNum++}: Add/update tests`);
+    if (verification.testCoverage.testFiles.length > 0) {
+      lines.push(`Test file: \`${verification.testCoverage.testFiles[0]}\``);
+    } else {
+      lines.push('Create tests covering:');
+      lines.push('- The bug scenario (should now work correctly)');
+      lines.push('- Edge cases (null dates, past dates, etc.)');
+    }
+    lines.push('');
+    
+    // Step 6: Verify
+    lines.push(`### Step ${stepNum++}: Verify the fix`);
+    lines.push('- Run tests');
+    lines.push('- Test manually in the application');
+    lines.push('- Verify the specific scenario from the bug report');
+    lines.push('');
+    
+    // Footer
+    lines.push('---');
+    lines.push('');
+    lines.push('_Generated by Task Automation Engine_');
+    
+    return lines.join('\n');
+  }
 }
 
 export default new AIGuidanceGenerator();

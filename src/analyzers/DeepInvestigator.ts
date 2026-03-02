@@ -370,9 +370,9 @@ export class DeepInvestigator {
       }
     }
     
-    // Extract specific function/method mentions (e.g., "getLODueDate()", "calculateDate")
+    // Extract specific function/method mentions (e.g., "getDueDate()", "calculateDate")
     const functionPatterns = [
-      /\b(get[A-Z][a-zA-Z]+)\b/g,           // getFoo, getLODueDate
+      /\b(get[A-Z][a-zA-Z]+)\b/g,           // getFoo, getDueDate, getEstimatedDate
       /\b(calculate[A-Z][a-zA-Z]+)\b/g,     // calculateFoo
       /\b(compute[A-Z][a-zA-Z]+)\b/g,       // computeFoo
       /\b([a-z]+(?:Date|DueDate|DeliveryDate|EstimatedDate))\b/g, // specificDate
@@ -459,33 +459,68 @@ export class DeepInvestigator {
   }
   
   /**
-   * Extract expected behavior from task
+   * Extract expected behavior from task (GAP 5 - Enhanced)
    */
   private extractExpectedBehavior(text: string): string {
-    // Look for "TO BE" or "expected" sections
-    const toBePattern = /to\s*be[:\s]+([^.!?]+(?:[.!?]\s+[^.!?]+)*)/gi;
-    const match = toBePattern.exec(text);
-    if (match) return match[1].trim();
+    const patterns = [
+      // Standard patterns
+      /to\s*be[:\s]+([^.!?]+(?:[.!?]\s+[^.!?]+)*)/gi,
+      /expected\s*(?:behavior|behaviour)?[:\s]+([^.!?]+)/gi,
+      // "should X" patterns - what should happen
+      /should\s+(?:be|use)\s+([^.!?]+)/gi,
+      // "correct" patterns
+      /correct(?:ly)?[:\s]+([^.!?]+)/gi,
+      // "use X instead" - the X is what we want
+      /use\s+([a-zA-Z_.]+)\s+instead/gi,
+      // Date calculation patterns - "Today + X"
+      /(today|now|current\s*date)\s*\+\s*([^.!?]+)/gi,
+      // "when X is Y, then Z" - the Z is expected behavior
+      /when\s+[^,]+,\s*(?:then\s+)?([^.!?]+)/gi,
+    ];
     
-    const expectedPattern = /expected\s*(?:behavior|behaviour)?[:\s]+([^.!?]+)/gi;
-    const expMatch = expectedPattern.exec(text);
-    if (expMatch) return expMatch[1].trim();
+    for (const pattern of patterns) {
+      const match = pattern.exec(text);
+      if (match && match[1]) {
+        const result = match[1].trim();
+        if (result.length > 5) {
+          return result;
+        }
+      }
+    }
     
     return '';
   }
   
   /**
-   * Extract actual (buggy) behavior from task
+   * Extract actual (buggy) behavior from task (GAP 5 - Enhanced)
    */
   private extractActualBehavior(text: string): string {
-    // Look for "AS IS" or "current" sections
-    const asIsPattern = /as\s*is[:\s]+([^.!?]+(?:[.!?]\s+[^.!?]+)*)/gi;
-    const match = asIsPattern.exec(text);
-    if (match) return match[1].trim();
+    const patterns = [
+      // Standard patterns
+      /as\s*is[:\s]+([^.!?]+(?:[.!?]\s+[^.!?]+)*)/gi,
+      /current(?:ly)?[:\s]+([^.!?]+)/gi,
+      // "wrong" patterns
+      /wrong\s*(?:calculation|behavior|behaviour)?[:\s]*([^.!?]+)/gi,
+      /incorrect\s*(?:calculation|behavior|behaviour)?[:\s]*([^.!?]+)/gi,
+      // "uses X instead of Y" - the X is the current (wrong) behavior
+      /uses\s+([a-zA-Z_.]+)\s+instead\s+of/gi,
+      // "current: X"
+      /current\s*:\s*([^.!?\n]+)/gi,
+      // "the error is"
+      /(?:the\s+)?(?:error|bug|issue)\s+is[:\s]+([^.!?]+)/gi,
+      // Date calculation patterns - "Planned Date + X" (wrong)
+      /(planned\s*(?:due\s*)?date|publication\s*date)\s*\+\s*([^.!?]+)/gi,
+    ];
     
-    const currentPattern = /current(?:ly)?[:\s]+([^.!?]+)/gi;
-    const currMatch = currentPattern.exec(text);
-    if (currMatch) return currMatch[1].trim();
+    for (const pattern of patterns) {
+      const match = pattern.exec(text);
+      if (match && match[1]) {
+        const result = match[1].trim();
+        if (result.length > 5) {
+          return result;
+        }
+      }
+    }
     
     return '';
   }
@@ -546,7 +581,117 @@ export class DeepInvestigator {
       }
     }
     
+    // GAP 2 FIX: When layer is frontend, actively search for frontend utility files
+    if (understanding.layer === 'frontend') {
+      const frontendProjects = workspace.projects.filter(p => 
+        p.type === 'frontend' || 
+        p.name.toLowerCase().includes('ui') ||
+        p.name.toLowerCase().includes('web') ||
+        p.name.toLowerCase().includes('frontend')
+      );
+      
+      for (const project of frontendProjects) {
+        // Search for utility files that might contain date calculations
+        const utilPatterns = ['util', 'utils', 'helper', 'helpers', 'shared', 'common'];
+        const datePatterns = ['date', 'due', 'delivery', 'estimate', 'calculation'];
+        
+        try {
+          const files = await this.findFilesInProject(project.path, utilPatterns);
+          
+          for (const file of files) {
+            // Check if file contains date-related code
+            const content = await this.readFileContent(file);
+            if (!content) continue;
+            
+            const hasDateLogic = datePatterns.some(p => content.toLowerCase().includes(p));
+            const hasAddDays = /add\w*days|add\w*weeks|addworkingdays/i.test(content);
+            
+            if (hasDateLogic || hasAddDays) {
+              // Extract function names from the file
+              const functionMatches = content.match(/(?:function|const|let|var)\s+(\w*(?:date|due|delivery|estimate)\w*)\s*[=(]/gi) || [];
+              const methodMatches = content.match(/(\w*(?:date|due|delivery|estimate)\w*)\s*\([^)]*\)\s*[:{]/gi) || [];
+              
+              const allMatches = [...functionMatches, ...methodMatches];
+              
+              findings.push({
+                type: 'potential-bug',
+                severity: 'high',
+                project: project.name,
+                file,
+                description: hasAddDays 
+                  ? `⚠️ LIKELY TARGET: Contains addWorkingDays-like logic`
+                  : `Contains date calculation logic - possible bug location`,
+                code: allMatches.length > 0 ? `Functions found: ${allMatches.slice(0, 3).join(', ')}` : undefined,
+              });
+            }
+          }
+        } catch (e) {
+          // Ignore read errors
+        }
+      }
+    }
+    
     return findings;
+  }
+  
+  /**
+   * Find files matching patterns in a project
+   */
+  private async findFilesInProject(projectPath: string, patterns: string[]): Promise<string[]> {
+    const results: string[] = [];
+    const { readdir, stat } = await import('fs/promises');
+    const path = await import('path');
+    
+    async function walk(dir: string, depth = 0): Promise<void> {
+      if (depth > 5) return; // Limit depth
+      
+      try {
+        const entries = await readdir(dir);
+        for (const entry of entries) {
+          if (entry.startsWith('.') || entry === 'node_modules' || entry === 'dist' || entry === 'build') continue;
+          
+          const fullPath = path.join(dir, entry);
+          const stats = await stat(fullPath);
+          
+          if (stats.isDirectory()) {
+            // Check if directory name matches pattern
+            if (patterns.some(p => entry.toLowerCase().includes(p))) {
+              await walk(fullPath, depth + 1);
+            } else {
+              await walk(fullPath, depth + 1);
+            }
+          } else if (stats.isFile()) {
+            const ext = path.extname(entry).toLowerCase();
+            const name = entry.toLowerCase();
+            
+            // Only TypeScript/JavaScript files
+            if (['.ts', '.tsx', '.js', '.jsx', '.vue'].includes(ext)) {
+              // Check if file name matches any pattern
+              if (patterns.some(p => name.includes(p))) {
+                results.push(fullPath);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore permission errors
+      }
+    }
+    
+    await walk(projectPath);
+    return results;
+  }
+  
+  /**
+   * Read file content safely
+   */
+  private async readFileContent(filePath: string): Promise<string | null> {
+    try {
+      const { readFile } = await import('fs/promises');
+      return await readFile(filePath, 'utf-8');
+    } catch {
+      return null;
+    }
   }
   
   /**

@@ -4,7 +4,7 @@ import { writeFile } from '../utils/file-utils.js';
 import TaskInputParser, { ParsedTaskInput, TaskType } from './TaskInputParser.js';
 import ProjectScanner from '../analyzers/ProjectScanner.js';
 import TaskVerifier, { TaskVerificationResult } from '../analyzers/TaskVerifier.js';
-import AIGuidanceGenerator, { AIInstructionSet } from '../analyzers/AIGuidanceGenerator.js';
+import AIGuidanceGeneratorInstance, { AIInstructionSet, AIGuidanceGenerator } from '../analyzers/AIGuidanceGenerator.js';
 import FilePolicy from './FilePolicy.js';
 import { ExecutionContext, ParsedTask, TaskStatus, ProjectSnapshot } from './types.js';
 import MultiProjectScanner, { Workspace, DetectedProject } from '../analyzers/MultiProjectScanner.js';
@@ -233,6 +233,26 @@ export class AgentOrchestrator {
                 logger.warn(`🚨   → ${p.name} (${p.path})`);
               });
               logger.warn('🚨'.repeat(30) + '\n');
+              
+              // GAP 4 FIX: Filter out backend files from relatedFiles when task is frontend
+              const frontendExtensions = ['.ts', '.tsx', '.js', '.jsx', '.vue', '.html', '.css', '.scss'];
+              const filteredFiles = verificationResult.relatedFiles.filter(f => 
+                frontendExtensions.some(ext => f.endsWith(ext))
+              );
+              
+              // If we filtered out everything, add frontend findings instead
+              if (filteredFiles.length === 0 && investigation.findings.length > 0) {
+                const frontendFindings = investigation.findings.filter(f =>
+                  f.file.includes('ui') || 
+                  frontendExtensions.some(ext => f.file.endsWith(ext))
+                );
+                verificationResult.relatedFiles = frontendFindings.map(f => f.file);
+              } else if (filteredFiles.length > 0) {
+                // Keep only frontend files
+                verificationResult.relatedFiles = filteredFiles;
+              }
+              
+              logger.info(`   📂 Filtered files to frontend only: ${verificationResult.relatedFiles.length} files`);
             }
           }
         }
@@ -247,7 +267,7 @@ export class AgentOrchestrator {
       let instructions: AIInstructionSet | undefined;
       if (decision.action !== 'inform') {
         logger.info('\n📝 Step 7: Generating guidance...');
-        instructions = await AIGuidanceGenerator.generate(context, verificationResult, taskUnderstanding.description);
+        instructions = await AIGuidanceGeneratorInstance.generate(context, verificationResult, taskUnderstanding.description);
       }
       
       // Step 9: Generate reports (enhanced with investigation data)
@@ -772,8 +792,39 @@ export class AgentOrchestrator {
       
       logger.info(`   📄 Report: ${reportPath}`);
       
+      // ALSO generate Implementation Guide (actionable instructions)
+      const implementationGuide = AIGuidanceGenerator.generateImplementationGuide(
+        taskId,
+        decision.details.taskUnderstanding.description,
+        verification,
+        investigation ? {
+          understanding: {
+            layer: investigation.understanding.layer,
+            type: investigation.understanding.type,
+            concepts: investigation.understanding.concepts,
+            expectedBehavior: investigation.understanding.expectedBehavior,
+            actualBehavior: investigation.understanding.actualBehavior,
+          },
+          findings: investigation.findings,
+          actions: investigation.actions,
+        } : undefined,
+        workspace ? {
+          projects: workspace.projects.map(p => ({
+            name: p.name,
+            path: p.path,
+            type: p.type,
+            language: p.language,
+          })),
+        } : undefined
+      );
+      const guidePath = path.join(outputDir, `implementation-guide-${taskId}.md`);
+      await writeFile(guidePath, implementationGuide);
+      
+      logger.info(`   📋 Implementation Guide: ${guidePath}`);
+      
       return {
         summary: reportPath,
+        guidance: guidePath,
       };
     }
     
@@ -786,7 +837,7 @@ export class AgentOrchestrator {
     
     let guidancePath: string | undefined;
     if (instructions) {
-      const guidance = await AIGuidanceGenerator.generateMarkdown(instructions);
+      const guidance = await AIGuidanceGeneratorInstance.generateMarkdown(instructions);
       guidancePath = path.join(outputDir, `agent-guidance-${timestamp}.md`);
       await writeFile(guidancePath, guidance);
     }
