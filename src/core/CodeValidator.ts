@@ -64,84 +64,86 @@ export class CodeValidator {
    * This handles different naming conventions across languages
    */
   private static generatePatternVariations(pattern: string): string[] {
-    const clean = this.cleanValue(pattern);
-    const variations: string[] = [clean];
+    const variations: string[] = [];
     
-    // Original case preserved
-    const original = pattern.replace(/[().,;:!?\[\]{}'"]/g, '').trim();
-    if (original.toLowerCase() !== clean) {
-      variations.push(original.toLowerCase());
+    // Preserve original structure BEFORE cleaning (important for dot notation and camelCase)
+    const originalWithCase = pattern.replace(/[();:!?\[\]{}'"]/g, '').trim(); // Keep dots and commas for now
+    const clean = this.cleanValue(pattern);
+    
+    variations.push(clean);
+
+    // CRITICAL: Handle dot notation FIRST (e.g., "order.createdAt")
+    // Extract the property part regardless of the object name
+    if (originalWithCase.includes('.')) {
+      const parts = originalWithCase.split('.');
+      const propertyPart = parts[parts.length - 1]; // "createdAt"
+      
+      if (propertyPart && propertyPart.length > 2) {
+        const propLower = propertyPart.toLowerCase();
+        variations.push(propLower);
+        
+        // Generate accessor variations for the property
+        const capitalizedProp = propertyPart.charAt(0).toUpperCase() + propertyPart.slice(1);
+        variations.push(('get' + capitalizedProp).toLowerCase()); // getcreatedat
+        variations.push(('set' + capitalizedProp).toLowerCase());
+        variations.push(('is' + capitalizedProp).toLowerCase());
+        variations.push(('has' + capitalizedProp).toLowerCase());
+        
+        // Snake case: createdAt -> created_at
+        const snakeCase = propertyPart.replace(/([A-Z])/g, '_$1').toLowerCase();
+        if (snakeCase !== propLower) {
+          variations.push(snakeCase);
+          variations.push('get_' + snakeCase);
+          variations.push('set_' + snakeCase);
+        }
+      }
     }
 
-    // If it's a property name like "createdAt", also search for:
-    // - getCreatedAt / setCreatedAt (Java/Kotlin getter/setter)
-    // - isCreatedAt (boolean getter)
-    // - get_created_at / set_created_at (Python-style)
-    // - created_at (snake_case)
-    if (/^[a-z]/.test(clean)) {
+    // Handle camelCase compounds using ORIGINAL case (e.g., "orderCreatedAt")
+    // This is backup for cases without dots
+    const camelParts = originalWithCase.replace(/\./g, '').split(/(?=[A-Z])/);
+    if (camelParts.length >= 2) {
+      const commonPrefixes = ['order', 'entity', 'item', 'user', 'request', 'response', 'data', 'input', 'output', 'obj', 'dto', 'model'];
+      const firstPart = camelParts[0].toLowerCase();
+      
+      if (commonPrefixes.includes(firstPart)) {
+        // Extract property: "orderCreatedAt" -> "CreatedAt" -> "createdAt"
+        const propertyPart = camelParts.slice(1).join('');
+        if (propertyPart.length > 2) {
+          const propLower = propertyPart.toLowerCase();
+          if (!variations.includes(propLower)) {
+            variations.push(propLower);
+            
+            const capitalizedProp = propertyPart.charAt(0).toUpperCase() + propertyPart.slice(1);
+            variations.push(('get' + capitalizedProp).toLowerCase());
+            variations.push(('set' + capitalizedProp).toLowerCase());
+            variations.push(('is' + capitalizedProp).toLowerCase());
+          }
+        }
+      }
+    }
+
+    // Standard accessor generation for the full pattern
+    if (/^[a-z]/.test(clean) && !clean.includes('.')) {
       const capitalizedProp = clean.charAt(0).toUpperCase() + clean.slice(1);
       
-      // Java/Kotlin/C# accessors
-      const getter = 'get' + capitalizedProp;
-      const setter = 'set' + capitalizedProp;
-      const boolGetter = 'is' + capitalizedProp;
-      const hasChecker = 'has' + capitalizedProp;
+      variations.push(('get' + capitalizedProp).toLowerCase());
+      variations.push(('set' + capitalizedProp).toLowerCase());
+      variations.push(('is' + capitalizedProp).toLowerCase());
+      variations.push(('has' + capitalizedProp).toLowerCase());
       
-      variations.push(getter.toLowerCase());
-      variations.push(setter.toLowerCase());
-      variations.push(boolGetter.toLowerCase());
-      variations.push(hasChecker.toLowerCase());
-      
-      // Snake case: createdAt -> created_at
+      // Snake case
       const snakeCase = clean.replace(/([A-Z])/g, '_$1').toLowerCase();
       if (snakeCase !== clean) {
         variations.push(snakeCase);
-        // Python-style accessors
         variations.push('get_' + snakeCase);
         variations.push('set_' + snakeCase);
       }
     }
 
-    // If it contains dots (like entity.property), extract the property part
-    if (clean.includes('.')) {
-      const parts = clean.split('.');
-      const lastPart = parts[parts.length - 1];
-      if (lastPart && !variations.includes(lastPart)) {
-        variations.push(lastPart);
-        // Also add accessor variations for the property
-        const capitalizedProp = lastPart.charAt(0).toUpperCase() + lastPart.slice(1);
-        variations.push(('get' + capitalizedProp).toLowerCase());
-        variations.push(('set' + capitalizedProp).toLowerCase());
-        variations.push(('is' + capitalizedProp).toLowerCase());
-      }
-    }
-
-    // Handle compound patterns like "orderCreatedAt" - extract the property part
-    // This handles cases where task says "order.createdAt" but code has "entity.getCreatedAt()"
-    // Split on camelCase boundaries and try variations with just the property name
-    const camelParts = clean.split(/(?=[A-Z])/);
-    if (camelParts.length >= 2) {
-      // Try removing common prefixes like "order", "entity", "item", "user", etc.
-      const commonPrefixes = ['order', 'entity', 'item', 'user', 'request', 'response', 'data', 'input', 'output'];
-      const firstPart = camelParts[0].toLowerCase();
-      
-      if (commonPrefixes.includes(firstPart)) {
-        // Extract the property part: "orderCreatedAt" -> "createdAt"
-        const propertyPart = camelParts.slice(1).join('');
-        if (propertyPart.length > 2) {
-          const propLower = propertyPart.toLowerCase();
-          variations.push(propLower);
-          
-          // Add accessor variations for the property
-          const capitalizedProp = propertyPart.charAt(0).toUpperCase() + propertyPart.slice(1);
-          variations.push(('get' + capitalizedProp).toLowerCase());
-          variations.push(('set' + capitalizedProp).toLowerCase());
-          variations.push(('is' + capitalizedProp).toLowerCase());
-        }
-      }
-    }
-
-    return [...new Set(variations)]; // Deduplicate
+    const result = [...new Set(variations)];
+    logger.debug(`  Pattern "${pattern}" variations: ${result.slice(0, 8).join(', ')}${result.length > 8 ? '...' : ''}`);
+    return result;
   }
 
   /**
